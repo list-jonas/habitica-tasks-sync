@@ -1,0 +1,59 @@
+# habitica-tasks-sync example configuration.
+#
+# Copy to `config.yaml` and fill in the values, then mount it into the
+# container at /etc/habitica-tasks-sync/config.yaml. Two pairs are shown
+# (Alice and Bob) — drop one if you only want a single user.
+
+# How often to run a full sync cycle (per pair). Minimum 30 s to stay
+# inside Habitica's 30-requests-per-minute rate limit.
+sync_interval_seconds: 300
+
+# Persistent SQLite state. Mount /data into the container.
+db_path: /data/sync.sqlite3
+
+# Logging level: DEBUG | INFO | WARNING | ERROR
+log_level: INFO
+
+# Whether deletes on one side should propagate to the other.
+delete_propagation: true
+
+# If true, exit on the first hard failure (useful for one-shot runs in CI).
+fail_fast: false
+
+# Habitica requires every third-party tool to identify itself with the
+# `x-client` header in the format <your-uuid>-<AppName>. This is YOUR
+# Habitica User ID (the developer's), not the syncing user's. Get one by
+# making a free Habitica account and copying the User ID from
+# Settings → Site Data.
+user_agent:
+  uuid: "00000000-0000-0000-0000-000000000000"  # <-- replace
+  app_name: "habitica-tasks-sync"
+
+# One pair per (Habitica account, Google account) combination. Two people
+# syncing through the same container = two pairs.
+pairs:
+  - name: alice
+    habitica:
+      # Habitica → Settings → Site Data → User ID / API Token.
+      # Both values are UUIDs.
+      user_id: "${ALICE_HABITICA_USER_ID}"
+      api_token: "${ALICE_HABITICA_API_TOKEN}"
+    google:
+      # OAuth client secret JSON downloaded from Google Cloud Console
+      # (Credentials → OAuth client ID → Desktop app). Reused across users.
+      credentials_file: /tokens/credentials.json
+      # Per-user token JSON minted with `habitica-tasks-sync-auth`.
+      token_file: /tokens/alice.json
+      # Either reference an existing tasklist by ID:
+      # tasklist_id: "MDIyNzAyMzAyMjg2NzQ3..."
+      # ...or by title (created if missing):
+      tasklist_title: "Habitica"
+
+  - name: bob
+    habitica:
+      user_id: "${BOB_HABITICA_USER_ID}"
+      api_token: "${BOB_HABITICA_API_TOKEN}"
+    google:
+      credentials_file: /tokens/credentials.json
+      token_file: /tokens/bob.json
+      tasklist_title: "Habitica"

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "habitica-tasks-sync"
+version = "0.1.0"
+description = "Bidirectional sync between Habitica todos and Google Tasks for one or more users."
+requires-python = ">=3.11"
+authors = [{ name = "habitica-tasks-sync contributors" }]
+license = { text = "MIT" }
+readme = "README.md"
+dependencies = [
+    "httpx>=0.27,<1",
+    "google-api-python-client>=2.140,<3",
+    "google-auth>=2.30,<3",
+    "google-auth-oauthlib>=1.2,<2",
+    "google-auth-httplib2>=0.2,<1",
+    "PyYAML>=6,<7",
+    "tenacity>=9,<10",
+]
+
+[project.scripts]
+habitica-tasks-sync = "habitica_tasks_sync.__main__:main"
+habitica-tasks-sync-auth = "habitica_tasks_sync.auth_helper:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+habitica_tasks_sync = ["py.typed"]
