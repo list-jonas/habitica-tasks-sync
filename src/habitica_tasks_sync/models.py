@@ -71,9 +71,19 @@ class HabiticaTask:
     updated_at: str = ""
     priority: float = 1.0
     alias: str | None = None
+    challenge_id: str | None = None  # set if task belongs to a challenge
+    group_id: str | None = None  # set if task is a group/party task
+
+    @property
+    def is_managed_externally(self) -> bool:
+        """True if the task is owned by a challenge or group and shouldn't be mutated."""
+
+        return bool(self.challenge_id or self.group_id)
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> HabiticaTask:
+        challenge = data.get("challenge") or {}
+        group = data.get("group") or {}
         return cls(
             id=data.get("id") or data.get("_id", ""),
             text=data.get("text", "") or "",
@@ -87,6 +97,8 @@ class HabiticaTask:
             updated_at=data.get("updatedAt", "") or "",
             priority=float(data.get("priority", 1.0) or 1.0),
             alias=data.get("alias"),
+            challenge_id=(challenge.get("id") if isinstance(challenge, dict) else None),
+            group_id=(group.get("id") if isinstance(group, dict) else None),
         )
 
     def to_canonical(self) -> CanonicalTask:

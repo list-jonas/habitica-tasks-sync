@@ -155,7 +155,14 @@ class SyncEngine:
         return self._tasklist_id
 
     def _fetch_habitica(self) -> list[HabiticaTask]:
-        return [t for t in self.h.list_todos(include_completed=True) if t.type == "todo"]
+        # Skip challenge/group tasks: they're owned by the challenge/group,
+        # not the user, so PUT/DELETE will return 401 with
+        # `challengeTasksNoUserDelete` etc. Treating them as out-of-scope is
+        # simpler than special-casing each mutation.
+        return [
+            t for t in self.h.list_todos(include_completed=True)
+            if t.type == "todo" and not t.is_managed_externally
+        ]
 
     def _fetch_google(self, tasklist_id: str) -> tuple[list[GoogleTask], str]:
         last = self.store.get_last_google_sync(self.pair.name)

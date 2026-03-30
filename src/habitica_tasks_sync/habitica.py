@@ -74,16 +74,20 @@ class HabiticaClient:
         if not user_id or not api_token:
             raise HabiticaError("Habitica user_id and api_token are required")
         self._user_id = user_id
+        # `x-client` is parsed by Habitica as `<UUID>-<AppName>` on the
+        # FIRST hyphen after the UUID; spaces or commas in the app name
+        # have triggered 400s in past Habitica versions, so sanitize.
+        safe_app = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in app_name) or "habitica-tasks-sync"
         self._http = httpx.Client(
             base_url=base_url,
             timeout=timeout,
             headers={
                 "x-api-user": user_id,
                 "x-api-key": api_token,
-                "x-client": f"{client_uuid}-{app_name}",
+                "x-client": f"{client_uuid}-{safe_app}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": f"{app_name}/0.1 (+https://github.com/)",
+                "User-Agent": f"{safe_app}/0.1 (+https://github.com/)",
             },
         )
 
