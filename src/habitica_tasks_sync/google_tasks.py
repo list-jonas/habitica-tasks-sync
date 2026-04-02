@@ -165,16 +165,21 @@ class GoogleTasksClient:
         out: list[GoogleTask] = []
         page_token: str | None = None
         while True:
-            req = self._service.tasks().list(
-                tasklist=tasklist,
-                maxResults=100,
-                pageToken=page_token,
-                showCompleted=show_completed,
-                showDeleted=show_deleted,
-                showHidden=show_hidden,
-                updatedMin=updated_min,
-            )
-            resp = self._call(req)
+            # `googleapiclient` includes None-valued kwargs as empty query
+            # params, which Google rejects as `Invalid format for date` for
+            # `updatedMin`. Build the kwargs conditionally.
+            kwargs: dict[str, Any] = {
+                "tasklist": tasklist,
+                "maxResults": 100,
+                "showCompleted": show_completed,
+                "showDeleted": show_deleted,
+                "showHidden": show_hidden,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            if updated_min:
+                kwargs["updatedMin"] = updated_min
+            resp = self._call(self._service.tasks().list(**kwargs))
             for item in resp.get("items", []) or []:
                 out.append(GoogleTask.from_api(item))
             page_token = resp.get("nextPageToken")
