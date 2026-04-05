@@ -22,7 +22,11 @@ CREATE TABLE IF NOT EXISTS task_map (
     habitica_id      TEXT NOT NULL,
     google_id        TEXT NOT NULL,
     google_tasklist  TEXT NOT NULL,
-    content_hash     TEXT NOT NULL,
+    -- Hashes are kept per-side because the two sides project a logical
+    -- task into different shapes: e.g. Habitica → Google flattens the
+    -- checklist into the notes field, so the round-tripped text differs.
+    habitica_hash    TEXT NOT NULL,
+    google_hash      TEXT NOT NULL,
     habitica_updated TEXT NOT NULL,
     google_updated   TEXT NOT NULL,
     last_synced_at   TEXT NOT NULL,
@@ -60,7 +64,8 @@ class TaskMapping:
     habitica_id: str
     google_id: str
     google_tasklist: str
-    content_hash: str
+    habitica_hash: str
+    google_hash: str
     habitica_updated: str
     google_updated: str
     last_synced_at: str
@@ -123,19 +128,22 @@ class StateStore:
                 """
                 INSERT INTO task_map(
                     pair_name, habitica_id, google_id, google_tasklist,
-                    content_hash, habitica_updated, google_updated, last_synced_at
-                ) VALUES (?,?,?,?,?,?,?,?)
+                    habitica_hash, google_hash,
+                    habitica_updated, google_updated, last_synced_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(pair_name, habitica_id) DO UPDATE SET
                     google_id        = excluded.google_id,
                     google_tasklist  = excluded.google_tasklist,
-                    content_hash     = excluded.content_hash,
+                    habitica_hash    = excluded.habitica_hash,
+                    google_hash      = excluded.google_hash,
                     habitica_updated = excluded.habitica_updated,
                     google_updated   = excluded.google_updated,
                     last_synced_at   = excluded.last_synced_at
                 """,
                 (
                     m.pair_name, m.habitica_id, m.google_id, m.google_tasklist,
-                    m.content_hash, m.habitica_updated, m.google_updated, m.last_synced_at,
+                    m.habitica_hash, m.google_hash,
+                    m.habitica_updated, m.google_updated, m.last_synced_at,
                 ),
             )
 
@@ -230,7 +238,8 @@ def _row_to_mapping(row: sqlite3.Row | None) -> TaskMapping | None:
         habitica_id=row["habitica_id"],
         google_id=row["google_id"],
         google_tasklist=row["google_tasklist"],
-        content_hash=row["content_hash"],
+        habitica_hash=row["habitica_hash"],
+        google_hash=row["google_hash"],
         habitica_updated=row["habitica_updated"],
         google_updated=row["google_updated"],
         last_synced_at=row["last_synced_at"],

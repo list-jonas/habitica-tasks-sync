@@ -261,8 +261,8 @@ class SyncEngine:
 
             h_can = h.to_canonical()
             g_can = g.to_canonical()
-            h_changed = (h.updated_at != mapping.habitica_updated) or (h_can.content_hash() != mapping.content_hash)
-            g_changed = (g.updated != mapping.google_updated) or (g_can.content_hash() != mapping.content_hash)
+            h_changed = (h.updated_at != mapping.habitica_updated) or (h_can.content_hash() != mapping.habitica_hash)
+            g_changed = (g.updated != mapping.google_updated) or (g_can.content_hash() != mapping.google_hash)
 
             if not h_changed and not g_changed:
                 continue
@@ -314,6 +314,8 @@ class SyncEngine:
             completed=completed_arg,
         )
         stats.updated_in_google += 1
+        # `new_g` reflects what Google actually stored (date-only `due`,
+        # truncations, etc.) — hash from that, not from our send-side view.
         self._record_mapping(h, new_g, mapping.google_tasklist or tasklist_id)
 
     def _push_google_to_habitica(
@@ -414,14 +416,19 @@ class SyncEngine:
     # --- mapping persistence -------------------------------------------
 
     def _record_mapping(self, h: HabiticaTask, g: GoogleTask, g_tasklist: str) -> None:
-        canonical = h.to_canonical()
+        # Hash each side from its own observed state. The two hashes can
+        # legitimately differ (e.g. Habitica's checklist gets flattened
+        # into Google's notes) — what matters is that each side's hash
+        # matches what's actually stored on that side, so we can detect
+        # subsequent edits without false positives every cycle.
         self.store.upsert_mapping(
             TaskMapping(
                 pair_name=self.pair.name,
                 habitica_id=h.id,
                 google_id=g.id,
                 google_tasklist=g_tasklist,
-                content_hash=canonical.content_hash(),
+                habitica_hash=h.to_canonical().content_hash(),
+                google_hash=g.to_canonical().content_hash(),
                 habitica_updated=h.updated_at,
                 google_updated=g.updated,
                 last_synced_at=_now_iso(),
