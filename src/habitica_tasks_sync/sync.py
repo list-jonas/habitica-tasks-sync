@@ -136,7 +136,12 @@ class SyncEngine:
 
         self.store.set_last_google_sync(self.pair.name, new_cursor)
 
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=self.tombstone_ttl_days)).isoformat()
+        # Use the same RFC3339 format as `_now_iso()` so lexicographic
+        # comparison of timestamps in SQLite is correct (mixing `+00:00`
+        # and `.000Z` suffixes produces wrong-order results).
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self.tombstone_ttl_days)
+        ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         pruned = self.store.prune_tombstones_older_than(cutoff)
         if pruned:
             log.debug("[%s] pruned %d expired tombstones", self.pair.name, pruned)
