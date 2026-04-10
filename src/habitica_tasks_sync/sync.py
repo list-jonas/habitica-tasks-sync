@@ -127,12 +127,18 @@ class SyncEngine:
             existing_mappings, h_by_id, g_by_id, tasklist_id, stats
         )
 
-        # 4) Create missing counterparts in both directions.
-        self._create_missing_in_google(h_by_id, existing_mappings, tasklist_id, stats)
+        # 4) Create missing counterparts in both directions. Pass the
+        # opposite-side index so unmapped tasks with matching titles can be
+        # adopted instead of duplicated (relevant on first sync).
+        self._create_missing_in_google(
+            h_by_id, existing_mappings, tasklist_id, stats, g_by_id=g_by_id,
+        )
 
         # Re-read mappings so the next direction sees what we just wrote.
         existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
-        self._create_missing_in_habitica(g_by_id, existing_mappings, tasklist_id, stats)
+        self._create_missing_in_habitica(
+            g_by_id, existing_mappings, tasklist_id, stats, h_by_id=h_by_id,
+        )
 
         self.store.set_last_google_sync(self.pair.name, new_cursor)
 
@@ -354,7 +360,22 @@ class SyncEngine:
         mappings: dict[str, TaskMapping],
         tasklist_id: str,
         stats: SyncStats,
+        g_by_id: dict[str, GoogleTask] | None = None,
     ) -> None:
+        # Index unmapped, undeleted Google tasks by normalized title so we
+        # can adopt an existing match instead of creating a duplicate.
+        # Only used on first sync (or when an old mapping was lost) — once
+        # mapped, the ID handles linkage.
+        mapped_google_ids = {m.google_id for m in mappings.values()}
+        adoption_pool: dict[str, GoogleTask] = {}
+        if g_by_id:
+            for g in g_by_id.values():
+                if g.deleted or g.id in mapped_google_ids:
+                    continue
+                key = _title_key(g.title)
+                # First seen wins (stable when iteration order is stable).
+                adoption_pool.setdefault(key, g)
+
         for h in h_by_id.values():
             if h.id in mappings:
                 continue
@@ -366,6 +387,13 @@ class SyncEngine:
                 continue
             try:
                 canonical = h.to_canonical()
+                key = _title_key(canonical.title)
+                adopted = adoption_pool.pop(key, None)
+                if adopted is not None:
+                    log.info("[%s] adopted existing google task %s for habitica %s (title match %r)",
+                             self.pair.name, adopted.id, h.id, canonical.title)
+                    self._record_mapping(h, adopted, tasklist_id)
+                    continue
                 new_g = self.g.insert_task(
                     tasklist_id,
                     title=canonical.title,
@@ -388,8 +416,19 @@ class SyncEngine:
         mappings: dict[str, TaskMapping],
         tasklist_id: str,
         stats: SyncStats,
+        h_by_id: dict[str, HabiticaTask] | None = None,
     ) -> None:
         mapped_google_ids = {m.google_id for m in mappings.values()}
+        mapped_habitica_ids = {m.habitica_id for m in mappings.values()}
+
+        adoption_pool: dict[str, HabiticaTask] = {}
+        if h_by_id:
+            for h in h_by_id.values():
+                if h.id in mapped_habitica_ids:
+                    continue
+                key = _title_key(h.text)
+                adoption_pool.setdefault(key, h)
+
         for g in g_by_id.values():
             if g.id in mapped_google_ids or g.deleted:
                 continue
@@ -397,6 +436,13 @@ class SyncEngine:
                 continue
             try:
                 canonical = g.to_canonical()
+                key = _title_key(canonical.title)
+                adopted = adoption_pool.pop(key, None)
+                if adopted is not None:
+                    log.info("[%s] adopted existing habitica task %s for google %s (title match %r)",
+                             self.pair.name, adopted.id, g.id, canonical.title)
+                    self._record_mapping(adopted, g, g_tasklist=tasklist_id)
+                    continue
                 new_h = self.h.create_todo(
                     text=canonical.title,
                     notes=canonical.notes,
@@ -452,6 +498,19 @@ def _parse_iso(value: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return datetime.fromtimestamp(0, tz=timezone.utc)
+
+
+def _title_key(title: str) -> str:
+    """Normalize a title for cross-side adoption matching on first sync.
+
+    Empty titles are excluded (returned as a sentinel that won't match
+    anything else). Otherwise: trim, collapse internal whitespace, lower.
+    """
+
+    cleaned = " ".join((title or "").split()).strip().lower()
+    if not cleaned:
+        return f"\x00empty\x00{id(title)}"
+    return cleaned
 
 
 def _merge_notes_for_google(canonical: CanonicalTask) -> str:
