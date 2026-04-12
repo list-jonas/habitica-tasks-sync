@@ -337,11 +337,12 @@ class SyncEngine:
         stats: SyncStats,
     ) -> None:
         canonical = g.to_canonical(checklist=h.to_canonical().checklist)
+        notes = _strip_checklist_artifact(canonical.notes)
         # Title/notes/due go through PUT; completion is its own endpoint.
         self.h.update_todo(
             h.id,
             text=canonical.title,
-            notes=canonical.notes,
+            notes=notes,
             due_date_iso=canonical.due_date,
             clear_due=canonical.due_date is None,
         )
@@ -513,6 +514,9 @@ def _title_key(title: str) -> str:
     return cleaned
 
 
+_CHECKLIST_HEADER = "— Checklist —"
+
+
 def _merge_notes_for_google(canonical: CanonicalTask) -> str:
     """Append checklist text to notes since Google Tasks has no checklist concept.
 
@@ -527,9 +531,25 @@ def _merge_notes_for_google(canonical: CanonicalTask) -> str:
     bullets = "\n".join(
         f"[{'x' if c.completed else ' '}] {c.text}" for c in canonical.checklist
     )
-    base = (canonical.notes or "").rstrip()
+    base = _strip_checklist_artifact(canonical.notes or "").rstrip()
     sep = "\n\n" if base else ""
-    return f"{base}{sep}— Checklist —\n{bullets}"
+    return f"{base}{sep}{_CHECKLIST_HEADER}\n{bullets}"
+
+
+def _strip_checklist_artifact(notes: str) -> str:
+    """Remove the trailing `— Checklist —` block we appended for Google.
+
+    When pushing Google → Habitica we don't want the bullets to land in
+    Habitica's notes (Habitica has a real checklist field). The block is
+    always at the end and starts with our sentinel header.
+    """
+
+    if not notes:
+        return ""
+    idx = notes.rfind(_CHECKLIST_HEADER)
+    if idx == -1:
+        return notes
+    return notes[:idx].rstrip()
 
 
 # Re-export for tests / external introspection.
