@@ -162,21 +162,24 @@ class GoogleTask:
 
 
 def _iso_to_date(value: str | None) -> str | None:
-    """Normalize any ISO 8601 timestamp (or None) to a YYYY-MM-DD string."""
+    """Normalize any ISO 8601 timestamp (or None) to a YYYY-MM-DD string.
+
+    We deliberately take the date prefix as-is rather than converting
+    through UTC. Both Habitica and Google represent due dates as midnight
+    in *some* timezone (Google strictly UTC, Habitica varies); converting
+    again can shift the visible date by ±1 day for users east/west of UTC.
+    The user's UI shows the date prefix unmodified, so mirror that.
+    """
 
     if not value:
         return None
+    head = value[:10]
+    # Cheap shape validation; reject e.g. "garbage" or non-ISO dates.
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        datetime.strptime(head, "%Y-%m-%d")
     except ValueError:
-        # Some Habitica due dates arrive as "YYYY-MM-DD".
-        try:
-            parsed = datetime.strptime(value[:10], "%Y-%m-%d")
-        except ValueError:
-            return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date().isoformat()
+        return None
+    return head
 
 
 def date_to_google_due(date_iso: str | None) -> str | None:
