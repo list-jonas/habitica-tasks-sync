@@ -13,7 +13,6 @@ ignored: they map awkwardly onto Google Tasks (which only knows todos).
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Iterable
 
 import httpx
@@ -58,6 +57,17 @@ _RETRYABLE_NETWORK = (
     httpx.WriteTimeout,
     httpx.ConnectTimeout,
 )
+
+
+def _habitica_wait_strategy(retry_state: Any) -> float:
+    """Honor `Retry-After` from 429s; otherwise exponential jitter backoff."""
+
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, HabiticaRateLimitError):
+        # Cap to 60 s so a misbehaving server can't hang us indefinitely.
+        return min(max(exc.retry_after, 1.0), 60.0)
+    base = wait_exponential_jitter(initial=1, max=30)
+    return base(retry_state)
 
 
 class HabiticaClient:
@@ -108,7 +118,7 @@ class HabiticaClient:
 
     @retry(
         retry=retry_if_exception_type((HabiticaRateLimitError, *_RETRYABLE_NETWORK)),
-        wait=wait_exponential_jitter(initial=1, max=30),
+        wait=_habitica_wait_strategy,
         stop=stop_after_attempt(5),
         reraise=True,
     )
@@ -120,9 +130,11 @@ class HabiticaClient:
             raise
 
         if resp.status_code == 429:
-            retry_after = float(resp.headers.get("Retry-After", "5"))
-            log.warning("habitica rate limited; sleeping %.1fs", retry_after)
-            time.sleep(retry_after)
+            # Honor Retry-After when present; default to 5 s. We only stash
+            # the value on the exception — the actual sleep happens in the
+            # custom wait strategy so we don't double-sleep.
+            retry_after = float(resp.headers.get("Retry-After", "5") or 5)
+            log.warning("habitica rate limited; will sleep %.1fs before retry", retry_after)
             raise HabiticaRateLimitError(
                 "Habitica rate limit exceeded",
                 retry_after=retry_after,
