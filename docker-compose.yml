@@ -11,7 +11,9 @@ services:
       # Sync state DB.
       - ./data:/data
       # OAuth client secret + per-user token files (mint with the auth helper on the host first).
-      - ./tokens:/tokens:ro
+      # Mounted read-write so refreshed access tokens (and the rare rotated
+      # refresh token) can be persisted back to the host.
+      - ./tokens:/tokens
       # Sync configuration.
       - ./config.yaml:/etc/habitica-tasks-sync/config.yaml:ro
     # Container is stateless apart from the volumes above. Logs go to stdout.

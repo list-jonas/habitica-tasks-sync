@@ -89,14 +89,30 @@ class GoogleTasksClient:
         return creds
 
     def _persist_credentials(self, creds: Credentials) -> None:
-        self._token_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._token_file.with_suffix(self._token_file.suffix + ".tmp")
-        tmp.write_text(creds.to_json(), encoding="utf-8")
-        tmp.replace(self._token_file)
+        """Atomically write the refreshed credentials back to disk.
+
+        If the token directory is mounted read-only or otherwise not
+        writable, log a warning and continue: the in-memory credentials
+        are still usable for the lifetime of this process. Loss of a
+        rotated refresh_token would only matter on the next process
+        start, and Google rotates refresh tokens infrequently.
+        """
+
         try:
-            self._token_file.chmod(0o600)
-        except OSError:
-            pass
+            self._token_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._token_file.with_suffix(self._token_file.suffix + ".tmp")
+            tmp.write_text(creds.to_json(), encoding="utf-8")
+            tmp.replace(self._token_file)
+            try:
+                self._token_file.chmod(0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            log.warning(
+                "could not persist refreshed Google credentials to %s (%s). "
+                "Mount the tokens directory writable to keep refresh tokens up to date.",
+                self._token_file, exc,
+            )
 
     def _ensure_fresh(self) -> None:
         with self._lock:
