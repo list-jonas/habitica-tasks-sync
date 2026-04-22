@@ -152,11 +152,19 @@ class GoogleTasksClient:
     def resolve_tasklist(self, *, tasklist_id: str | None, title: str | None) -> str:
         """Resolve a tasklist to its ID, creating one with `title` if needed.
 
-        Precedence: explicit `tasklist_id` > matching `title` > newly created
-        list using `title` > the user's default ("@default").
+        Precedence: explicit `tasklist_id` (validated to exist) > matching
+        `title` > newly created list using `title` > the user's default
+        ("@default"). A misconfigured `tasklist_id` raises immediately so
+        the user gets a clear error instead of opaque 404s on every cycle.
         """
 
         if tasklist_id:
+            tl = self.get_tasklist(tasklist_id)
+            if tl is None:
+                raise GoogleAuthError(
+                    f"Configured Google tasklist_id {tasklist_id!r} does not exist "
+                    f"or is not accessible with the current OAuth grant."
+                )
             return tasklist_id
         if title:
             for tl in self.list_tasklists():

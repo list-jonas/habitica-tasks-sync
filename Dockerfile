@@ -38,9 +38,7 @@ ENV HABITICA_SYNC_CONFIG=/etc/habitica-tasks-sync/config.yaml
 
 VOLUME ["/data", "/tokens", "/etc/habitica-tasks-sync"]
 
-HEALTHCHECK --interval=5m --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import sqlite3, os, sys, pathlib; \
-p = pathlib.Path(os.environ.get('HABITICA_SYNC_DB', '/data/sync.sqlite3')); \
-sys.exit(0 if p.exists() else 1)"
+HEALTHCHECK --interval=5m --timeout=10s --start-period=2m --retries=3 \
+    CMD python -m habitica_tasks_sync.healthcheck
 
 ENTRYPOINT ["/usr/bin/tini", "--", "python", "-m", "habitica_tasks_sync"]
