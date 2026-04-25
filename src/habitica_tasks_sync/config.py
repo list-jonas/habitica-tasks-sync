@@ -90,7 +90,10 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
 
     raw = _interpolate_env(raw)
 
-    interval = int(raw.get("sync_interval_seconds", 300))
+    try:
+        interval = int(raw.get("sync_interval_seconds", 300))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"sync_interval_seconds must be an integer: {exc}") from exc
     if interval < 30:
         raise ConfigError("sync_interval_seconds must be >= 30 to respect Habitica rate limits")
 
@@ -164,9 +167,16 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
         log_level=str(raw.get("log_level", "INFO")).upper(),
         delete_propagation=bool(raw.get("delete_propagation", True)),
         initial_full_sync=bool(raw.get("initial_full_sync", True)),
-        http_timeout_seconds=float(raw.get("http_timeout_seconds", 30.0)),
+        http_timeout_seconds=_to_float(raw.get("http_timeout_seconds", 30.0), "http_timeout_seconds"),
         fail_fast=bool(raw.get("fail_fast", False)),
     )
+
+
+def _to_float(value: Any, field: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field} must be a number: {exc}") from exc
 
 
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*?))?\}")
