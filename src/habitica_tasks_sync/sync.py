@@ -211,6 +211,16 @@ class SyncEngine:
         for habitica_id, mapping in list(mappings.items()):
             if habitica_id in h_by_id:
                 continue
+            # Habitica's `completedTodos` list is capped at the 30 most
+            # recent entries. A mapped task that's missing from the list
+            # could be (a) genuinely deleted, or (b) just an older
+            # completed todo. Verify by direct GET before propagating a
+            # delete — if the task still exists, treat it as visible and
+            # let the regular sync path handle any state changes.
+            actual = self.h.get_todo(habitica_id)
+            if actual is not None and actual.type == "todo" and not actual.is_managed_externally:
+                h_by_id[habitica_id] = actual
+                continue
             try:
                 self.g.delete_task(mapping.google_tasklist or tasklist_id, mapping.google_id)
                 self.store.add_tombstone(
