@@ -104,12 +104,16 @@ class SyncEngine:
         log.info("[%s] sync start (tasklist=%s)", self.pair.name, tasklist_id)
 
         habitica_tasks = self._fetch_habitica()
-        google_tasks, new_cursor = self._fetch_google(tasklist_id)
+        # If the mapping table is empty (first sync, or DB lost) we need a
+        # FULL Google fetch — otherwise the title-adoption pool only sees
+        # tasks updated within the cursor window and will create
+        # duplicates for older Google tasks.
+        existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
+        force_full_google = not existing_mappings
+        google_tasks, new_cursor = self._fetch_google(tasklist_id, force_full=force_full_google)
 
         h_by_id = {t.id: t for t in habitica_tasks}
         g_by_id = {t.id: t for t in google_tasks}
-
-        existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
 
         # 1) Propagate Habitica deletions → Google.
         if self.delete_propagation:
@@ -175,23 +179,22 @@ class SyncEngine:
             if t.type == "todo" and not t.is_managed_externally
         ]
 
-    def _fetch_google(self, tasklist_id: str) -> tuple[list[GoogleTask], str]:
-        last = self.store.get_last_google_sync(self.pair.name)
+    def _fetch_google(self, tasklist_id: str, *, force_full: bool = False) -> tuple[list[GoogleTask], str]:
+        last = None if force_full else self.store.get_last_google_sync(self.pair.name)
         # Always overlap the cursor by a few minutes to absorb clock skew between
         # Google's servers and ours. Duplicates are deduped by ID downstream.
+        cursor_iso: str | None = None
         if last:
             try:
                 anchor = datetime.fromisoformat(last.replace("Z", "+00:00"))
             except ValueError:
                 anchor = datetime.now(timezone.utc) - timedelta(days=7)
-        else:
-            anchor = datetime.now(timezone.utc) - timedelta(days=3650)
-        cursor = (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
-        cursor_iso = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            cursor = (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
+            cursor_iso = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         tasks = self.g.list_tasks(
             tasklist_id,
-            updated_min=cursor_iso if last else None,
+            updated_min=cursor_iso,
             show_completed=True,
             show_deleted=True,
             show_hidden=True,
@@ -223,10 +226,17 @@ class SyncEngine:
                 continue
             try:
                 self.g.delete_task(mapping.google_tasklist or tasklist_id, mapping.google_id)
-                self.store.add_tombstone(
-                    self.pair.name, "google", mapping.google_id, _now_iso()
+                # Mapping removal + tombstone in one transaction so a
+                # crash here can't leave us with a deleted-on-Google task
+                # that gets recreated next cycle (no tombstone) or a
+                # stale mapping that re-attempts the delete forever.
+                self.store.remove_mapping_with_tombstone(
+                    self.pair.name,
+                    habitica_id,
+                    tombstone_side="google",
+                    tombstone_id=mapping.google_id,
+                    when_iso=_now_iso(),
                 )
-                self.store.delete_mapping(self.pair.name, habitica_id)
                 stats.deleted_in_google += 1
                 log.info("[%s] deleted google task %s (was habitica %s)",
                          self.pair.name, mapping.google_id, habitica_id)
@@ -250,10 +260,13 @@ class SyncEngine:
                 deleted = self.h.delete_todo(habitica_id)
                 if deleted:
                     stats.deleted_in_habitica += 1
-                self.store.add_tombstone(
-                    self.pair.name, "habitica", habitica_id, _now_iso()
+                self.store.remove_mapping_with_tombstone(
+                    self.pair.name,
+                    habitica_id,
+                    tombstone_side="habitica",
+                    tombstone_id=habitica_id,
+                    when_iso=_now_iso(),
                 )
-                self.store.delete_mapping(self.pair.name, habitica_id)
                 log.info("[%s] deleted habitica task %s (was google %s)",
                          self.pair.name, habitica_id, google_id)
             except Exception as exc:  # noqa: BLE001
@@ -292,7 +305,7 @@ class SyncEngine:
                 if h_changed and not g_changed:
                     self._push_habitica_to_google(h, g, mapping, tasklist_id, stats)
                 elif g_changed and not h_changed:
-                    self._push_google_to_habitica(g, h, mapping, stats)
+                    self._push_google_to_habitica(g, h, mapping, tasklist_id, stats)
                 else:
                     # Both changed — last writer wins.
                     h_ts = _parse_iso(h.updated_at)
@@ -301,7 +314,7 @@ class SyncEngine:
                     if g_ts >= h_ts:
                         log.info("[%s] conflict on %s ↔ %s: google wins (%s vs %s)",
                                  self.pair.name, h.id, g.id, g.updated, h.updated_at)
-                        self._push_google_to_habitica(g, h, mapping, stats)
+                        self._push_google_to_habitica(g, h, mapping, tasklist_id, stats)
                     else:
                         log.info("[%s] conflict on %s ↔ %s: habitica wins (%s vs %s)",
                                  self.pair.name, h.id, g.id, h.updated_at, g.updated)
@@ -344,6 +357,7 @@ class SyncEngine:
         g: GoogleTask,
         h: HabiticaTask,
         mapping: TaskMapping,
+        tasklist_id: str,
         stats: SyncStats,
     ) -> None:
         canonical = g.to_canonical(checklist=h.to_canonical().checklist)
@@ -361,7 +375,7 @@ class SyncEngine:
         # Re-fetch to capture fresh updatedAt + computed completion timestamp.
         refreshed = self.h.get_todo(h.id) or h
         stats.updated_in_habitica += 1
-        self._record_mapping(refreshed, g, mapping.google_tasklist)
+        self._record_mapping(refreshed, g, mapping.google_tasklist or tasklist_id)
 
     # --- creations ------------------------------------------------------
 
