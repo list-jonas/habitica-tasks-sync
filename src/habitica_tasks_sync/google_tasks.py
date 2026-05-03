@@ -127,9 +127,10 @@ class GoogleTasksClient:
         out: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
-            resp = self._call(
-                self._service.tasklists().list(maxResults=100, pageToken=page_token)
-            )
+            kwargs: dict[str, Any] = {"maxResults": 100}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = self._call(self._service.tasklists().list(**kwargs))
             out.extend(resp.get("items", []) or [])
             page_token = resp.get("nextPageToken")
             if not page_token:
@@ -268,8 +269,11 @@ class GoogleTasksClient:
             body["status"] = "completed"
             body["completed"] = _now_rfc3339()
         elif completed is False:
+            # Setting status flips the task back to needsAction; the API
+            # clears `completed` automatically. Sending `completed=null`
+            # has been observed to leave a stale timestamp on some
+            # Google rollouts, so omit the field entirely.
             body["status"] = "needsAction"
-            body["completed"] = None
         if not body:
             current = self.get_task(tasklist, task_id)
             if current is None:
@@ -291,7 +295,12 @@ class GoogleTasksClient:
     # --- helpers --------------------------------------------------------
 
     def _call(self, request: Any) -> Any:
-        """Execute a discovery `request`, retrying on 429/5xx with backoff."""
+        """Execute a discovery `request`, retrying on 429/5xx with backoff.
+
+        `googleapiclient.HttpRequest` is reusable for non-resumable calls
+        (which all of ours are), so we can re-`execute()` the same object
+        rather than rebuilding it on every retry.
+        """
 
         delay = 1.0
         for attempt in range(6):
@@ -300,7 +309,7 @@ class GoogleTasksClient:
             except HttpError as exc:
                 status = getattr(exc.resp, "status", None)
                 if status in (429, 500, 502, 503, 504) and attempt < 5:
-                    retry_after = float(exc.resp.get("retry-after", "0") or 0) or delay
+                    retry_after = _retry_after_seconds(exc) or delay
                     log.warning("google tasks %s; retrying in %.1fs", status, retry_after)
                     time.sleep(retry_after)
                     delay = min(delay * 2, 30)
@@ -311,6 +320,30 @@ class GoogleTasksClient:
 
 def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _retry_after_seconds(exc: HttpError) -> float:
+    """Pull the Retry-After value from an HttpError response, case-tolerant.
+
+    `httplib2.Response` *should* normalize header names to lowercase, but
+    we've seen camelCase keys leak through depending on the underlying
+    transport (urllib3, gRPC fallback, etc.). Try both.
+    """
+
+    resp = exc.resp
+    raw = ""
+    for key in ("retry-after", "Retry-After"):
+        try:
+            value = resp.get(key)
+        except Exception:  # noqa: BLE001
+            value = None
+        if value:
+            raw = value
+            break
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def overlap_window(now: datetime, *, minutes: int = 5) -> str:

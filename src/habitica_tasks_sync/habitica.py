@@ -47,6 +47,10 @@ class HabiticaRateLimitError(HabiticaError):
         self.retry_after = retry_after
 
 
+class HabiticaServerError(HabiticaError):
+    """5xx from Habitica — transient, safe to retry."""
+
+
 _RETRYABLE_NETWORK = (
     httpx.ConnectError,
     httpx.ReadError,
@@ -117,7 +121,7 @@ class HabiticaClient:
     # --- low-level ------------------------------------------------------
 
     @retry(
-        retry=retry_if_exception_type((HabiticaRateLimitError, *_RETRYABLE_NETWORK)),
+        retry=retry_if_exception_type((HabiticaRateLimitError, HabiticaServerError, *_RETRYABLE_NETWORK)),
         wait=_habitica_wait_strategy,
         stop=stop_after_attempt(5),
         reraise=True,
@@ -143,9 +147,17 @@ class HabiticaClient:
             )
 
         if resp.status_code >= 500:
-            # 5xx is transient — let tenacity retry by raising a network-class error.
+            # 5xx is transient — raise a dedicated exception (tenacity
+            # will retry). Avoid `httpx.RemoteProtocolError` here: it
+            # has a `.request` property that raises if not constructed
+            # by httpx itself, making it awkward for code (or tests) to
+            # introspect the error.
             log.warning("habitica %s on %s %s", resp.status_code, method, path)
-            raise httpx.RemoteProtocolError(f"Habitica {resp.status_code}")
+            raise HabiticaServerError(
+                f"Habitica server error {resp.status_code}",
+                status=resp.status_code,
+                body=_safe_json(resp),
+            )
 
         if resp.status_code >= 400:
             body = _safe_json(resp)
