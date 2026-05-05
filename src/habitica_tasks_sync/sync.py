@@ -37,6 +37,7 @@ next cycle.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -525,16 +526,21 @@ def _parse_iso(value: str) -> datetime:
         return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
+_EMPTY_KEY_COUNTER = itertools.count()
+
+
 def _title_key(title: str) -> str:
     """Normalize a title for cross-side adoption matching on first sync.
 
-    Empty titles are excluded (returned as a sentinel that won't match
-    anything else). Otherwise: trim, collapse internal whitespace, lower.
+    Empty/whitespace titles are excluded from matching by returning a
+    globally unique sentinel each call (so no two empty-title tasks ever
+    adopt each other). Otherwise: trim, collapse internal whitespace,
+    lower.
     """
 
     cleaned = " ".join((title or "").split()).strip().lower()
     if not cleaned:
-        return f"\x00empty\x00{id(title)}"
+        return f"\x00empty\x00{next(_EMPTY_KEY_COUNTER)}"
     return cleaned
 
 
