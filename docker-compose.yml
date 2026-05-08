@@ -4,6 +4,11 @@ services:
     image: habitica-tasks-sync:latest
     container_name: habitica-tasks-sync
     restart: unless-stopped
+    # Give the daemon enough time to finish a pending HTTP call before
+    # SIGKILL. The default 10 s isn't enough when an in-flight Habitica/
+    # Google call is mid-retry; 45 s comfortably exceeds the 30 s HTTP
+    # timeout default.
+    stop_grace_period: 45s
     environment:
       - HABITICA_SYNC_CONFIG=/etc/habitica-tasks-sync/config.yaml
       - TZ=${TZ:-UTC}
@@ -12,7 +17,8 @@ services:
       - ./data:/data
       # OAuth client secret + per-user token files (mint with the auth helper on the host first).
       # Mounted read-write so refreshed access tokens (and the rare rotated
-      # refresh token) can be persisted back to the host.
+      # refresh token) can be persisted back to the host. The container's
+      # entrypoint chowns the directory to the `app` user on startup.
       - ./tokens:/tokens
       # Sync configuration.
       - ./config.yaml:/etc/habitica-tasks-sync/config.yaml:ro

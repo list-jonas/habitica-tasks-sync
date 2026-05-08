@@ -131,12 +131,17 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
         )
 
         g = p.get("google") or {}
-        creds_file = Path(str(g.get("credentials_file", ""))).expanduser()
-        token_file = Path(str(g.get("token_file", ""))).expanduser()
-        if not str(creds_file):
+        creds_raw = str(g.get("credentials_file", "")).strip()
+        token_raw = str(g.get("token_file", "")).strip()
+        # Guard before wrapping in `Path` — `Path("")` becomes `Path(".")`,
+        # which is truthy and would hide a missing value until the OAuth
+        # flow blows up at runtime.
+        if not creds_raw:
             raise ConfigError(f"pairs[{i}].google.credentials_file is required")
-        if not str(token_file):
+        if not token_raw:
             raise ConfigError(f"pairs[{i}].google.token_file is required")
+        creds_file = Path(creds_raw).expanduser()
+        token_file = Path(token_raw).expanduser()
 
         tasklist_id = g.get("tasklist_id")
         tasklist_title = g.get("tasklist_title")
@@ -183,12 +188,25 @@ _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*?))?\}")
 
 
 def _interpolate_env(value: Any) -> Any:
-    """Replace `${VAR}` and `${VAR:-default}` placeholders in any nested string."""
+    """Replace `${VAR}` and `${VAR:-default}` placeholders in any nested string.
+
+    A `${VAR}` reference without a default that resolves to an unset env
+    var raises immediately so missing secrets surface at startup instead
+    of as opaque downstream errors (empty UUIDs, paths that became `.`).
+    Use `${VAR:-}` to opt into "may be empty".
+    """
 
     if isinstance(value, str):
         def repl(m: re.Match[str]) -> str:
             name, default = m.group(1), m.group(2)
-            return os.environ.get(name, default if default is not None else "")
+            if name in os.environ:
+                return os.environ[name]
+            if default is None:
+                raise ConfigError(
+                    f"Environment variable {name!r} is referenced in the config "
+                    f"but is not set. Use ${{{name}:-default}} to provide a fallback."
+                )
+            return default
 
         return _ENV_RE.sub(repl, value)
     if isinstance(value, dict):

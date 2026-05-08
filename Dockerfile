@@ -9,10 +9,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System packages: tini for clean signal handling, ca-certificates for HTTPS,
-# tzdata so RFC3339 conversions respect the host timezone if requested.
+# System packages:
+#   tini             clean signal forwarding (zombie reaping)
+#   ca-certificates  HTTPS to Habitica/Google
+#   tzdata           respect TZ env var for timestamp formatting
+#   gosu             drop root → app at runtime (lighter than su/sudo,
+#                    exec-replaces so signals reach Python)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends tini ca-certificates tzdata gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first to maximize layer caching.
@@ -32,13 +36,18 @@ RUN groupadd --gid ${APP_GID} app \
     && mkdir -p /data /etc/habitica-tasks-sync /tokens \
     && chown -R app:app /data /etc/habitica-tasks-sync /tokens
 
-USER app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-ENV HABITICA_SYNC_CONFIG=/etc/habitica-tasks-sync/config.yaml
+ENV HABITICA_SYNC_CONFIG=/etc/habitica-tasks-sync/config.yaml \
+    APP_USER=app
 
 VOLUME ["/data", "/tokens", "/etc/habitica-tasks-sync"]
 
 HEALTHCHECK --interval=5m --timeout=10s --start-period=2m --retries=3 \
     CMD python -m habitica_tasks_sync.healthcheck
 
-ENTRYPOINT ["/usr/bin/tini", "--", "python", "-m", "habitica_tasks_sync"]
+# Stay root for the entrypoint so it can fix bind-mount ownership; it
+# drops to `app` via gosu before exec'ing the daemon.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["python", "-m", "habitica_tasks_sync"]

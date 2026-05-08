@@ -30,3 +30,5 @@ docker-compose.yml
 Dockerfile
 .dockerignore
 tests
+# Keep docker-entrypoint.sh available — Dockerfile copies it in.
+!docker-entrypoint.sh
