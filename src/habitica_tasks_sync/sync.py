@@ -342,7 +342,7 @@ class SyncEngine:
         new_g = self.g.patch_task(
             mapping.google_tasklist or tasklist_id,
             g.id,
-            title=canonical.title,
+            title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
             notes=notes,
             due_date_iso=canonical.due_date,
             clear_due=canonical.due_date is None and g.due is not None,
@@ -422,7 +422,7 @@ class SyncEngine:
                     continue
                 new_g = self.g.insert_task(
                     tasklist_id,
-                    title=canonical.title,
+                    title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
                     notes=_merge_notes_for_google(canonical),
                     due_date_iso=canonical.due_date,
                     completed=canonical.completed,
@@ -546,6 +546,21 @@ def _title_key(title: str) -> str:
 
 _CHECKLIST_HEADER = "— Checklist —"
 
+# Per Google Tasks API: title ≤ 1024, notes ≤ 8192. Habitica's limits are
+# higher (or unenforced), so the binding side is always Google.
+GOOGLE_TITLE_MAX = 1024
+GOOGLE_NOTES_MAX = 8192
+_TRUNCATION_SUFFIX = "… [truncated]"
+
+
+def _truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    head = limit - len(_TRUNCATION_SUFFIX)
+    if head <= 0:
+        return value[:limit]
+    return value[:head] + _TRUNCATION_SUFFIX
+
 
 def _merge_notes_for_google(canonical: CanonicalTask) -> str:
     """Append checklist text to notes since Google Tasks has no checklist concept.
@@ -554,16 +569,19 @@ def _merge_notes_for_google(canonical: CanonicalTask) -> str:
     bullet list at the bottom of `notes` so the user still sees it in
     Google. Round-tripping back is best-effort: if the user edits the notes
     and the bullets get garbled, Habitica's checklist is the source of truth.
+
+    The combined output is truncated to Google's 8192-char notes limit so
+    we never get a 400 for an over-long body.
     """
 
+    base = _strip_checklist_artifact(canonical.notes or "").rstrip()
     if not canonical.checklist:
-        return canonical.notes or ""
+        return _truncate(base, GOOGLE_NOTES_MAX)
     bullets = "\n".join(
         f"[{'x' if c.completed else ' '}] {c.text}" for c in canonical.checklist
     )
-    base = _strip_checklist_artifact(canonical.notes or "").rstrip()
     sep = "\n\n" if base else ""
-    return f"{base}{sep}{_CHECKLIST_HEADER}\n{bullets}"
+    return _truncate(f"{base}{sep}{_CHECKLIST_HEADER}\n{bullets}", GOOGLE_NOTES_MAX)
 
 
 def _strip_checklist_artifact(notes: str) -> str:

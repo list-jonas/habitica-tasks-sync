@@ -319,6 +319,25 @@ def test_checklist_flattens_to_google_notes(tmp_path: Path):
     assert "[ ] Passport" in g_task["notes"]
 
 
+def test_notes_truncated_to_google_limit(tmp_path: Path):
+    from habitica_tasks_sync.sync import GOOGLE_NOTES_MAX
+    eng, h, g, _, _ = _engine(tmp_path)
+    long_notes = "x" * (GOOGLE_NOTES_MAX + 5000)
+    h.create_todo(text="big", notes=long_notes)
+    eng.run_once()
+    g_task = next(iter(g._store.values()))
+    assert len(g_task["notes"]) <= GOOGLE_NOTES_MAX
+
+
+def test_title_truncated_to_google_limit(tmp_path: Path):
+    from habitica_tasks_sync.sync import GOOGLE_TITLE_MAX
+    eng, h, g, _, _ = _engine(tmp_path)
+    h.create_todo(text="x" * (GOOGLE_TITLE_MAX + 100))
+    eng.run_once()
+    g_task = next(iter(g._store.values()))
+    assert len(g_task["title"]) <= GOOGLE_TITLE_MAX
+
+
 def test_strip_checklist_artifact():
     raw = "Pack early\n\n— Checklist —\n[x] Tickets\n[ ] Passport"
     assert _strip_checklist_artifact(raw) == "Pack early"
