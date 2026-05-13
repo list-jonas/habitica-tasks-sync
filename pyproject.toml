@@ -20,6 +20,11 @@ dependencies = [
     "tenacity>=9,<10",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
 [project.scripts]
 habitica-tasks-sync = "habitica_tasks_sync.__main__:main"
 habitica-tasks-sync-auth = "habitica_tasks_sync.auth_helper:main"

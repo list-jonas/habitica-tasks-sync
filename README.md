@@ -29,6 +29,10 @@ intentionally not synced — they have no equivalent on the Google side.
    tombstoned so they aren't recreated next cycle.
 3. When both sides changed since the last sync, the side with the later
    `updatedAt` wins.
+4. On the very first sync (empty mapping table) tasks with matching
+   titles on both sides are *adopted* into a single mapping rather than
+   duplicated, so existing users with content on both sides don't end up
+   with two copies of everything.
 
 ## Setup
 
@@ -118,3 +122,29 @@ HABITICA_SYNC_CONFIG=./config.yaml python -m habitica_tasks_sync
 
 Append another entry under `pairs:` and mint another token JSON. No code
 changes needed.
+
+## Environment variables in config
+
+The config file supports `${VAR}` and `${VAR:-default}` interpolation.
+A bare `${VAR}` reference for an unset variable raises an error at
+startup — use the `:-` form to opt into "may be empty". This keeps a
+forgotten `export` from silently producing blank credentials.
+
+```yaml
+habitica:
+  user_id: "${ALICE_HABITICA_USER_ID}"           # required
+  api_token: "${ALICE_HABITICA_API_TOKEN}"       # required
+  app_name: "${SYNC_APP_NAME:-habitica-tasks-sync}"  # optional
+```
+
+## Development
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .[dev]
+.venv/bin/pytest
+```
+
+The test suite uses in-memory stub clients to exercise the full sync
+algorithm — no network calls.
