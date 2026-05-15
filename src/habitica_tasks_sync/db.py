@@ -205,35 +205,36 @@ class StateStore:
         self,
         pair_name: str,
         habitica_id: str,
-        *,
-        tombstone_side: str,
-        tombstone_id: str,
+        google_id: str,
         when_iso: str,
     ) -> None:
-        """Atomically delete a mapping and write its tombstone.
+        """Atomically delete a mapping and tombstone BOTH IDs.
 
         Splitting these into two transactions exposes a window where a
         crash can either resurrect the foreign task (no tombstone left to
         block the next-cycle create) or repeatedly retry a remote delete
-        that already succeeded. Doing both in a single BEGIN IMMEDIATE
-        closes the gap.
+        that already succeeded.
+
+        Both sides get tombstoned because the `_create_missing_in_*`
+        paths check the tombstone on whichever side they're considering
+        as the source. If only one side were tombstoned, an undelete /
+        un-flag on the other side would resurrect the task.
         """
 
-        if tombstone_side not in ("habitica", "google"):
-            raise ValueError(f"invalid tombstone side: {tombstone_side!r}")
         with self.transaction() as c:
             c.execute(
                 "DELETE FROM task_map WHERE pair_name=? AND habitica_id=?",
                 (pair_name, habitica_id),
             )
-            c.execute(
-                """
-                INSERT INTO tombstones(pair_name, side, foreign_id, deleted_at)
-                VALUES (?,?,?,?)
-                ON CONFLICT(pair_name, side, foreign_id) DO UPDATE SET deleted_at = excluded.deleted_at
-                """,
-                (pair_name, tombstone_side, tombstone_id, when_iso),
-            )
+            for side, foreign_id in (("habitica", habitica_id), ("google", google_id)):
+                c.execute(
+                    """
+                    INSERT INTO tombstones(pair_name, side, foreign_id, deleted_at)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(pair_name, side, foreign_id) DO UPDATE SET deleted_at = excluded.deleted_at
+                    """,
+                    (pair_name, side, foreign_id, when_iso),
+                )
 
     def has_tombstone(self, pair_name: str, side: str, foreign_id: str) -> bool:
         with self._lock:

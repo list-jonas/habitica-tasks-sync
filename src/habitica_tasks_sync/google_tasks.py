@@ -117,7 +117,17 @@ class GoogleTasksClient:
     def _ensure_fresh(self) -> None:
         with self._lock:
             if self._creds.expired and self._creds.refresh_token:
-                self._creds.refresh(Request())
+                try:
+                    self._creds.refresh(Request())
+                except RefreshError as exc:
+                    # A revoked or otherwise unrecoverable refresh token
+                    # surfaces as RefreshError. Re-raise as GoogleAuthError
+                    # so the main loop's per-pair guard logs a clear
+                    # message and skips this pair instead of spinning on
+                    # an exception every cycle.
+                    raise GoogleAuthError(
+                        f"Google token refresh failed: {exc}. Re-run the auth helper."
+                    ) from exc
                 self._persist_credentials(self._creds)
 
     # --- tasklists ------------------------------------------------------

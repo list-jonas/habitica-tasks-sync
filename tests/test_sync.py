@@ -264,12 +264,31 @@ def test_tombstone_blocks_recreate_after_habitica_delete(tmp_path: Path):
     ht = h.create_todo(text="One-shot")
     eng.run_once()
     google_id = next(iter(g._store))
-    # User deletes on Habitica -> we delete on Google -> tombstone google_id.
+    # User deletes on Habitica -> we delete on Google -> paired tombstones.
     h.delete_todo(ht.id)
     eng.run_once()
     assert store.has_tombstone("alice", "google", google_id)
+    assert store.has_tombstone("alice", "habitica", ht.id)
     # Google still returns the deleted task in its list with deleted=true;
     # the create path should NOT resurrect it as a new Habitica task.
+    eng.run_once()
+    assert len(h._store) == 0
+
+
+def test_tombstone_blocks_recreate_after_google_delete(tmp_path: Path):
+    eng, h, g, store, _ = _engine(tmp_path)
+    gt = g.insert_task("tl1", title="One-shot")
+    eng.run_once()
+    habitica_id = next(iter(h._store))
+    # User deletes on Google -> we delete on Habitica -> paired tombstones.
+    g.delete_task("tl1", gt.id)
+    eng.run_once()
+    assert store.has_tombstone("alice", "habitica", habitica_id)
+    assert store.has_tombstone("alice", "google", gt.id)
+    # Defensive scenario: Google flips `deleted` back to false (e.g. user
+    # restores from trash). The google-side tombstone should still block
+    # resurrection on Habitica.
+    g._store[gt.id]["deleted"] = False
     eng.run_once()
     assert len(h._store) == 0
 

@@ -227,15 +227,16 @@ class SyncEngine:
                 continue
             try:
                 self.g.delete_task(mapping.google_tasklist or tasklist_id, mapping.google_id)
-                # Mapping removal + tombstone in one transaction so a
+                # Mapping removal + tombstones in one transaction so a
                 # crash here can't leave us with a deleted-on-Google task
                 # that gets recreated next cycle (no tombstone) or a
-                # stale mapping that re-attempts the delete forever.
+                # stale mapping that re-attempts the delete forever. Both
+                # sides get tombstoned in case either system returns the
+                # task again (ID reuse, undelete, missed `deleted` flag).
                 self.store.remove_mapping_with_tombstone(
                     self.pair.name,
-                    habitica_id,
-                    tombstone_side="google",
-                    tombstone_id=mapping.google_id,
+                    habitica_id=habitica_id,
+                    google_id=mapping.google_id,
                     when_iso=_now_iso(),
                 )
                 stats.deleted_in_google += 1
@@ -263,9 +264,8 @@ class SyncEngine:
                     stats.deleted_in_habitica += 1
                 self.store.remove_mapping_with_tombstone(
                     self.pair.name,
-                    habitica_id,
-                    tombstone_side="habitica",
-                    tombstone_id=habitica_id,
+                    habitica_id=habitica_id,
+                    google_id=google_id,
                     when_iso=_now_iso(),
                 )
                 log.info("[%s] deleted habitica task %s (was google %s)",

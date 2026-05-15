@@ -52,12 +52,13 @@ def test_atomic_remove_with_tombstone(tmp_path: Path):
     store = StateStore(tmp_path / "db.sqlite3")
     store.upsert_mapping(_mapping())
     store.remove_mapping_with_tombstone(
-        "alice", "h1",
-        tombstone_side="google", tombstone_id="g1",
+        "alice", habitica_id="h1", google_id="g1",
         when_iso="2026-05-16T10:05:00.000Z",
     )
     assert store.get_by_habitica("alice", "h1") is None
+    # Both sides get tombstoned so a return on either side is blocked.
     assert store.has_tombstone("alice", "google", "g1")
+    assert store.has_tombstone("alice", "habitica", "h1")
 
 
 def test_tombstone_prune(tmp_path: Path):

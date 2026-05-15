@@ -39,12 +39,11 @@ def main() -> int:
         return 1
 
     try:
-        conn = sqlite3.connect(str(db), timeout=2.0)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT MAX(last_run_at) AS last_run FROM sync_state"
-        ).fetchone()
-        conn.close()
+        with sqlite3.connect(str(db), timeout=2.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT MAX(last_run_at) AS last_run FROM sync_state"
+            ).fetchone()
     except sqlite3.Error as exc:
         print(f"healthcheck: db query failed: {exc}", file=sys.stderr)
         return 1
