@@ -39,6 +39,27 @@ RUN groupadd --gid ${APP_GID} app \
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Optional build-time bake-in for config.yaml and tokens/.
+#
+# If the build context contains them (e.g. injected by Dokploy
+# "Patches" or committed locally) they're copied into the image so the
+# container can run without any host mounts beyond /data.
+#
+# We use a BuildKit bind mount so the build context isn't materialized
+# into an image layer — only what we explicitly `cp` lands in the
+# image. `2>/dev/null || true` makes the step a no-op when the source
+# files are absent (mount-at-runtime deployments).
+RUN --mount=type=bind,source=.,target=/build-ctx,ro \
+    if [ -f /build-ctx/config.yaml ]; then \
+        cp /build-ctx/config.yaml /etc/habitica-tasks-sync/config.yaml && \
+        chown app:app /etc/habitica-tasks-sync/config.yaml ; \
+    fi && \
+    if [ -d /build-ctx/tokens ]; then \
+        cp -a /build-ctx/tokens/. /tokens/ 2>/dev/null || true ; \
+        chown -R app:app /tokens ; \
+        chmod 600 /tokens/*.json 2>/dev/null || true ; \
+    fi
+
 ENV HABITICA_SYNC_CONFIG=/etc/habitica-tasks-sync/config.yaml \
     APP_USER=app
 

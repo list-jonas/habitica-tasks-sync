@@ -15,15 +15,14 @@ __pycache__
 htmlcov
 .coverage
 data
-tokens
-config.yaml
-config.yml
 config.local.*
-credentials.json
-token.json
 *.sqlite
 *.sqlite3
 *.db
+# NOTE: config.yaml + tokens/ are intentionally NOT excluded so that
+# build-time file injection (Dokploy "Patches", committed-locally
+# setups) works. The Dockerfile bakes them in only if present.
+# Keep them out of the git repo via .gitignore — never commit secrets.
 README.md
 LICENSE
 docker-compose.yml
