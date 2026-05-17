@@ -143,6 +143,10 @@ class SyncEngine:
 
     def run_once(self) -> SyncStats:
         stats = SyncStats(pair=self.pair.name)
+        # Re-resolve every cycle so a tag renamed (or a new list added) in
+        # Habitica/Google between cycles takes effect on the next run, even
+        # if this engine instance lives longer than one cycle.
+        self._routing = None
         routing = self._resolve_routing()
         log.info(
             "[%s] sync start (tasklists=%d, multi=%s)",
@@ -534,14 +538,12 @@ class SyncEngine:
         old_tasklist = mapping.google_tasklist or g.tasklist_id
         if not old_tasklist:
             return None
-        canonical = h.to_canonical()
-        new_g = self.g.insert_task(
-            new_tasklist_id,
-            title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
-            notes=_merge_notes_for_google(canonical),
-            due_date_iso=canonical.due_date,
-            completed=canonical.completed,
-        )
+        # Strip the OLD list's tag BEFORE we insert + record the mapping,
+        # so the recorded `habitica_updated` matches Habitica's
+        # post-strip view. Habitica bumps updatedAt on tag changes; if we
+        # recorded the mapping with the pre-strip view, the next cycle
+        # would see a phantom updatedAt mismatch and push the task
+        # back to Google with no real content change.
         old_tag_id = routing.tag_id_for_tasklist(old_tasklist)
         new_tag_id = routing.tag_id_for_tasklist(new_tasklist_id)
         if old_tag_id and old_tag_id != new_tag_id and old_tag_id in h.tags:
@@ -554,6 +556,14 @@ class SyncEngine:
                 refreshed = self.h.get_todo(h.id)
                 if refreshed is not None:
                     h = refreshed
+        canonical = h.to_canonical()
+        new_g = self.g.insert_task(
+            new_tasklist_id,
+            title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
+            notes=_merge_notes_for_google(canonical),
+            due_date_iso=canonical.due_date,
+            completed=canonical.completed,
+        )
         self._record_mapping(h, new_g, new_tasklist_id)
         try:
             self.g.delete_task(old_tasklist, g.id)

@@ -549,6 +549,57 @@ def test_habitica_task_without_tag_routes_to_default_and_gets_tagged(tmp_path: P
     assert personal_tag in h._store[ht.id]["tags"]
 
 
+def test_move_carries_content_changes(tmp_path: Path):
+    """Title and tag changing in the same cycle should land both in the
+    target list with the new title and not leave a stale copy behind."""
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    ht = h.create_todo(text="Old title")
+    eng.run_once()
+    work_tag = _tag_id(h, "work")
+
+    raw = h._store[ht.id]
+    raw["text"] = "New title"
+    raw["tags"] = [work_tag]
+    raw["updatedAt"] = h.clock.tick()
+
+    stats = eng.run_once()
+    assert stats.moved_in_google == 1
+    work_live = [r for r in g._bucket("tl-work").values() if not r.get("deleted")]
+    assert len(work_live) == 1
+    assert work_live[0]["title"] == "New title"
+    # The mapping should now reference the new google task in tl-work.
+    mapping = store.list_for_pair("alice")[0]
+    assert mapping.google_tasklist == "tl-work"
+    assert mapping.google_id == work_live[0]["id"]
+    # Next cycle should be a no-op.
+    stats = eng.run_once()
+    assert stats.moved_in_google == 0
+    assert stats.updated_in_google == 0
+    assert stats.updated_in_habitica == 0
+
+
+def test_move_is_idempotent_next_cycle(tmp_path: Path):
+    """A move should leave the mapping consistent with what the next
+    cycle reads back — no phantom updatedAt drift causing a second
+    sync to redo work."""
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    ht = h.create_todo(text="Plan")
+    eng.run_once()  # in personal
+    work_tag = _tag_id(h, "work")
+
+    raw = h._store[ht.id]
+    raw["tags"] = [work_tag]
+    raw["updatedAt"] = h.clock.tick()
+
+    eng.run_once()  # triggers the move
+    stats = eng.run_once()  # should be a no-op
+    assert stats.moved_in_google == 0
+    assert stats.updated_in_google == 0
+    assert stats.updated_in_habitica == 0
+    assert stats.created_in_google == 0
+    assert stats.created_in_habitica == 0
+
+
 def test_move_drops_old_list_tag(tmp_path: Path):
     """A move triggered by adding a new tag should also strip the old
     list's tag, otherwise routing is non-deterministic next time tags
