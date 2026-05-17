@@ -48,7 +48,7 @@ import itertools
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from .config import SyncPair, TasklistConfig
 from .db import StateStore, TaskMapping
@@ -668,6 +668,11 @@ class SyncEngine:
                 target = self._intended_tasklist_for_habitica(h, routing) or routing.default_tasklist_id
                 adoption_pool.setdefault((target, _title_key(h.text)), h)
 
+        # First pass: handle adoptions inline and collect everything we
+        # still need to create. Batching the creates into a single bulk
+        # call keeps the initial sync inside the Habitica rate budget.
+        pending: list[tuple[GoogleTask, str, str | None, str | None]] = []
+        pending_bodies: list[dict[str, Any]] = []
         for g in g_by_id.values():
             if g.id in mapped_google_ids or g.deleted:
                 continue
@@ -683,20 +688,47 @@ class SyncEngine:
                 if adopted is not None:
                     log.info("[%s] adopted existing habitica task %s for google %s (title match %r, list=%s)",
                              self.pair.name, adopted.id, g.id, canonical.title, source_tasklist)
-                    # Tag first so the recorded mapping matches Habitica's
-                    # post-tag updatedAt.
                     if tag_id and tag_id not in adopted.tags:
                         adopted = self._ensure_habitica_has_tasklist_tag(adopted, source_tasklist, routing)
                     self._record_mapping(adopted, g, source_tasklist)
                     continue
 
-                new_h = self.h.create_todo(
-                    text=canonical.title,
-                    notes=canonical.notes,
-                    due_date_iso=canonical.due_date,
-                    tags=[tag_id] if tag_id else (),
-                )
-                if canonical.completed:
+                pending.append((g, source_tasklist, tag_id, tag_name))
+                pending_bodies.append({
+                    "text": canonical.title,
+                    "notes": canonical.notes,
+                    "due_date_iso": canonical.due_date,
+                    "tags": [tag_id] if tag_id else (),
+                })
+            except Exception as exc:  # noqa: BLE001
+                stats.errors += 1
+                log.exception("[%s] failed to plan habitica task for google %s: %s",
+                              self.pair.name, g.id, exc)
+
+        if not pending:
+            return
+
+        try:
+            created = self.h.create_todos(pending_bodies)
+        except HabiticaError as exc:
+            stats.errors += len(pending)
+            log.exception("[%s] bulk habitica create failed (%d tasks): %s",
+                          self.pair.name, len(pending), exc)
+            return
+
+        if len(created) != len(pending):
+            # Habitica returned fewer/more than we asked for. Refuse to
+            # guess at the alignment — surface as errors and let the
+            # next cycle retry (the mapping table tracks what's missing).
+            stats.errors += len(pending)
+            log.error("[%s] bulk habitica create returned %d tasks for %d submitted; aborting create pass",
+                      self.pair.name, len(created), len(pending))
+            return
+
+        for (g, source_tasklist, tag_id, tag_name), new_h in zip(pending, created):
+            try:
+                g_canonical = g.to_canonical()
+                if g_canonical.completed:
                     try:
                         self.h.score_todo(new_h.id, complete=True)
                         new_h = self.h.get_todo(new_h.id) or new_h
@@ -709,7 +741,7 @@ class SyncEngine:
                          self.pair.name, new_h.id, g.id, source_tasklist, tag_name)
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
-                log.exception("[%s] failed to create habitica task for google %s: %s",
+                log.exception("[%s] failed to finalize habitica task for google %s: %s",
                               self.pair.name, g.id, exc)
 
     # --- routing helpers -----------------------------------------------

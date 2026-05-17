@@ -82,6 +82,18 @@ class StubHabitica:
         self._store[new_id] = raw
         return HabiticaTask.from_api(raw)
 
+    def create_todos(self, items: list[dict[str, Any]]) -> list[HabiticaTask]:
+        return [
+            self.create_todo(
+                text=it.get("text", ""),
+                notes=it.get("notes", ""),
+                due_date_iso=it.get("due_date_iso"),
+                checklist=it.get("checklist") or (),
+                tags=it.get("tags") or (),
+            )
+            for it in items
+        ]
+
     # Tag CRUD --------------------------------------------------------
 
     def list_tags(self) -> list[dict[str, Any]]:
@@ -718,6 +730,31 @@ def test_newly_added_tasklist_does_full_initial_pull(tmp_path: Path):
     # We should have pulled "Old work task" into Habitica.
     titles = {t["text"] for t in h._store.values()}
     assert "Old work task" in titles
+
+
+def test_initial_sync_uses_bulk_create_for_habitica(tmp_path: Path):
+    """A large G→H first sync should issue exactly one bulk create
+    instead of one create per task — otherwise the Habitica rate
+    limiter would dominate the cycle."""
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    for i in range(30):
+        g.insert_task("tl-work", title=f"Task {i}")
+
+    # Verify the engine batches the creates into bulk calls. The stub's
+    # create_todos delegates to create_todo internally; spy only on the
+    # bulk entrypoint so we count what the ENGINE invoked, not what the
+    # stub did downstream.
+    bulk_calls: list[int] = []
+    real_bulk = h.create_todos
+    def spy_bulk(items):
+        bulk_calls.append(len(items))
+        return real_bulk(items)
+    h.create_todos = spy_bulk  # type: ignore[assignment]
+
+    eng.run_once()
+    # One bulk call covering all 30 tasks (well under the 100-per-chunk cap).
+    assert bulk_calls == [30]
+    assert len(h._store) == 30
 
 
 def test_legacy_pair_cursor_bootstraps_known_tasklist(tmp_path: Path):

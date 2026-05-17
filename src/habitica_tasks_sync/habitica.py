@@ -264,19 +264,52 @@ class HabiticaClient:
         alias: str | None = None,
         tags: Iterable[str] = (),
     ) -> HabiticaTask:
-        body: dict[str, Any] = {"type": "todo", "text": text or "(untitled)", "notes": notes or ""}
-        if due_date_iso:
-            body["date"] = date_to_habitica_due(due_date_iso)
-        cl = [_sanitize_checklist_item(c) for c in checklist]
-        if cl:
-            body["checklist"] = cl
-        if alias:
-            body["alias"] = alias
-        tag_list = [t for t in (str(x) for x in tags) if t]
-        if tag_list:
-            body["tags"] = tag_list
+        body = _build_create_body(
+            text=text, notes=notes, due_date_iso=due_date_iso,
+            checklist=checklist, alias=alias, tags=tags,
+        )
         data = self._request("POST", "/tasks/user", json=body)
         return HabiticaTask.from_api(data)
+
+    def create_todos(self, items: list[dict[str, Any]]) -> list[HabiticaTask]:
+        """Bulk-create todos in one round trip.
+
+        Habitica's POST /tasks/user accepts an array body and creates
+        every entry in a single transaction — invaluable for an initial
+        sync that would otherwise spend hundreds of individual creates
+        chewing through the 30 req/min budget. Returns the created
+        tasks in the same order they were submitted.
+
+        Callers pass the same per-item dict shape as `create_todo`'s
+        kwargs (text/notes/due_date_iso/checklist/tags); this method
+        normalises each entry before sending. Habitica caps the array
+        size; we chunk at 100 to stay well inside that.
+        """
+
+        if not items:
+            return []
+        bodies = [
+            _build_create_body(
+                text=it.get("text", ""),
+                notes=it.get("notes", ""),
+                due_date_iso=it.get("due_date_iso"),
+                checklist=it.get("checklist") or (),
+                alias=it.get("alias"),
+                tags=it.get("tags") or (),
+            )
+            for it in items
+        ]
+        out: list[HabiticaTask] = []
+        chunk_size = 100
+        for i in range(0, len(bodies), chunk_size):
+            chunk = bodies[i : i + chunk_size]
+            data = self._request("POST", "/tasks/user", json=chunk)
+            if isinstance(data, dict):
+                # Habitica sometimes returns a single object for a one-element array.
+                data = [data]
+            for raw in data or []:
+                out.append(HabiticaTask.from_api(raw))
+        return out
 
     def update_todo(
         self,
@@ -437,6 +470,33 @@ def _parse_rate_limit_reset(value: str | None) -> float | None:
     if 0 < n <= 120:
         return n
     return None
+
+
+def _build_create_body(
+    *,
+    text: str,
+    notes: str = "",
+    due_date_iso: str | None = None,
+    checklist: Iterable[dict[str, Any]] = (),
+    alias: str | None = None,
+    tags: Iterable[str] = (),
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "type": "todo",
+        "text": text or "(untitled)",
+        "notes": notes or "",
+    }
+    if due_date_iso:
+        body["date"] = date_to_habitica_due(due_date_iso)
+    cl = [_sanitize_checklist_item(c) for c in checklist]
+    if cl:
+        body["checklist"] = cl
+    if alias:
+        body["alias"] = alias
+    tag_list = [t for t in (str(x) for x in tags) if t]
+    if tag_list:
+        body["tags"] = tag_list
+    return body
 
 
 def _sanitize_checklist_item(item: dict[str, Any]) -> dict[str, Any]:
