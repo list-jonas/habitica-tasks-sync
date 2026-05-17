@@ -29,10 +29,14 @@ from habitica_tasks_sync.sync import SyncEngine, _strip_checklist_artifact, _tit
 
 
 class _Clock:
-    """Monotonically advancing UTC clock for deterministic 'updated' values."""
+    """Monotonically advancing UTC clock for deterministic 'updated' values.
+
+    Anchored far in the future so the sync engine's real-time `updatedMin`
+    cursor never filters stub tasks out on the second cycle.
+    """
 
     def __init__(self) -> None:
-        self._t = datetime(2026, 5, 16, tzinfo=timezone.utc)
+        self._t = datetime(2099, 1, 1, tzinfo=timezone.utc)
 
     def tick(self, seconds: float = 1.0) -> str:
         self._t += timedelta(seconds=seconds)
