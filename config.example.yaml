@@ -44,7 +44,8 @@ pairs:
       credentials_file: /tokens/credentials.json
       # Per-user token JSON minted with `habitica-tasks-sync-auth`.
       token_file: /tokens/alice.json
-      # Either reference an existing tasklist by ID:
+      # Single-list mode (legacy): one Google Tasks list, no tag routing.
+      # Either reference an existing tasklist by ID...
       # tasklist_id: "MDIyNzAyMzAyMjg2NzQ3..."
       # ...or by title (created if missing):
       tasklist_title: "Habitica"
@@ -56,4 +57,13 @@ pairs:
     google:
       credentials_file: /tokens/credentials.json
       token_file: /tokens/bob.json
-      tasklist_title: "Habitica"
+      # Multi-list mode: every list pairs with a Habitica tag of the
+      # same name (override per-entry with `tag:`). The first entry is
+      # the default — new Habitica tasks without any of the configured
+      # tags land there, and the default's tag is added back to the
+      # Habitica task. Lists/tags are created on first sync if missing.
+      tasklists:
+        - title: "Personal"     # default list; tag defaults to "Personal"
+        - title: "Work"
+        - title: "Shopping"
+          tag: "errand"          # tag name doesn't have to match the title

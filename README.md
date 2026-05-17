@@ -16,8 +16,11 @@ config couples one Habitica account with one Google Tasks list.
 | Checklist | `checklist[]` | flattened into `notes` |
 | Deletes | propagated both ways | propagated both ways |
 
-Habits, dailies, rewards, tags, priority, attribute and reminders are
+Habits, dailies, rewards, priority, attribute and reminders are
 intentionally not synced — they have no equivalent on the Google side.
+Tags *are* used (but not synced as content): in multi-list mode each
+configured Google Tasks list is paired with a Habitica tag, and tasks
+are routed between sides based on which list-tag they carry.
 
 ## How it works
 
@@ -122,6 +125,41 @@ HABITICA_SYNC_CONFIG=./config.yaml python -m habitica_tasks_sync
 
 Append another entry under `pairs:` and mint another token JSON. No code
 changes needed.
+
+## Syncing multiple Google Tasks lists per Habitica account
+
+To sync more than one Google list into the same Habitica account, list
+them under `google.tasklists` instead of the single-list
+`tasklist_id` / `tasklist_title`:
+
+```yaml
+google:
+  credentials_file: /tokens/credentials.json
+  token_file: /tokens/alice.json
+  tasklists:
+    - title: "Personal"   # default list (first entry); tag defaults to "Personal"
+    - title: "Work"
+    - title: "Shopping"
+      tag: "errand"        # tag may differ from the list title
+```
+
+Routing rules:
+
+- Each list pairs with one Habitica tag. Tags (and lists) are created on
+  first sync if they don't exist yet. Existing Habitica tags are matched
+  case-insensitively.
+- A new Google task is created in Habitica with the source list's tag
+  attached.
+- A new Habitica task ends up in the Google list whose tag is on the
+  task. If none of the configured tags are present, the task lands in
+  the first configured list and that list's tag is added back to the
+  Habitica task so the next cycle is deterministic.
+- Changing the tag on an existing Habitica task migrates the matching
+  Google task to the new list (delete on the old, recreate on the new —
+  Google Tasks has no cross-list move).
+- Adoption-by-title on first sync only collapses tasks within the same
+  configured list, so a "Personal" Habitica todo won't be merged into a
+  same-named "Work" Google task by mistake.
 
 ## Environment variables in config
 
