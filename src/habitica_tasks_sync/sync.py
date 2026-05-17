@@ -189,6 +189,8 @@ class SyncEngine:
         )
 
         self.store.set_last_google_sync(self.pair.name, new_cursor)
+        for tlid in routing.tasklist_ids:
+            self.store.set_last_tasklist_sync(self.pair.name, tlid, new_cursor)
 
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=self.tombstone_ttl_days)
@@ -261,18 +263,28 @@ class SyncEngine:
         ]
 
     def _fetch_google(self, routing: TasklistRouting, *, force_full: bool = False) -> tuple[list[GoogleTask], str]:
-        last = None if force_full else self.store.get_last_google_sync(self.pair.name)
-        cursor_iso: str | None = None
-        if last:
-            try:
-                anchor = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            except ValueError:
-                anchor = datetime.now(timezone.utc) - timedelta(days=7)
-            cursor = (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
-            cursor_iso = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        """Pull tasks across every configured tasklist using a per-list cursor.
 
+        A tasklist with no per-list cursor row gets a full pull so a
+        newly-added list (or a first-ever sync) doesn't drop the
+        pre-existing tasks. The cursor is advanced by run_once after a
+        successful cycle, not here.
+        """
+
+        new_cursor = overlap_window(datetime.now(timezone.utc), minutes=0)
         all_tasks: list[GoogleTask] = []
         for tlid in routing.tasklist_ids:
+            last = None if force_full else self.store.get_last_tasklist_sync(self.pair.name, tlid)
+            cursor_iso: str | None = None
+            if last:
+                try:
+                    anchor = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                except ValueError:
+                    anchor = datetime.now(timezone.utc) - timedelta(days=7)
+                cursor = (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
+                cursor_iso = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            else:
+                log.info("[%s] no cursor for tasklist %s — doing full pull", self.pair.name, tlid)
             tasks = self.g.list_tasks(
                 tlid,
                 updated_min=cursor_iso,
@@ -280,12 +292,10 @@ class SyncEngine:
                 show_deleted=True,
                 show_hidden=True,
             )
-            # Make sure tasklist_id is set (defensive: client already does this).
             for t in tasks:
                 if not t.tasklist_id:
                     t.tasklist_id = tlid
             all_tasks.extend(tasks)
-        new_cursor = overlap_window(datetime.now(timezone.utc), minutes=0)
         return all_tasks, new_cursor
 
     # --- deletions ------------------------------------------------------

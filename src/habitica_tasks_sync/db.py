@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_run_at      TEXT
 );
 
+-- Per-tasklist cursor so newly-configured Google lists trigger a full
+-- pull on their first encounter instead of being silently filtered by
+-- the global pair-level cursor.
+CREATE TABLE IF NOT EXISTS sync_state_tasklist (
+    pair_name        TEXT NOT NULL,
+    tasklist_id      TEXT NOT NULL,
+    last_sync        TEXT,
+    PRIMARY KEY (pair_name, tasklist_id)
+);
+
 CREATE TABLE IF NOT EXISTS tombstones (
     pair_name        TEXT NOT NULL,
     side             TEXT NOT NULL,         -- 'habitica' | 'google'
@@ -270,6 +280,28 @@ class StateStore:
                     last_run_at      = excluded.last_run_at
                 """,
                 (pair_name, when_iso, when_iso),
+            )
+
+    # --- per-tasklist cursors ------------------------------------------
+
+    def get_last_tasklist_sync(self, pair_name: str, tasklist_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_sync FROM sync_state_tasklist WHERE pair_name=? AND tasklist_id=?",
+                (pair_name, tasklist_id),
+            ).fetchone()
+        return row["last_sync"] if row else None
+
+    def set_last_tasklist_sync(self, pair_name: str, tasklist_id: str, when_iso: str) -> None:
+        with self.transaction() as c:
+            c.execute(
+                """
+                INSERT INTO sync_state_tasklist(pair_name, tasklist_id, last_sync)
+                VALUES(?,?,?)
+                ON CONFLICT(pair_name, tasklist_id) DO UPDATE SET
+                    last_sync = excluded.last_sync
+                """,
+                (pair_name, tasklist_id, when_iso),
             )
 
 

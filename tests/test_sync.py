@@ -615,6 +615,37 @@ def test_multi_list_delete_propagates_with_correct_tasklist(tmp_path: Path):
     assert store.has_tombstone("alice", "google", gt.id)
 
 
+def test_newly_added_tasklist_does_full_initial_pull(tmp_path: Path):
+    """Adding a list mid-life must not silently skip its existing tasks.
+
+    The per-pair cursor used to mean a newly-configured list was filtered
+    out from its very first cycle. Per-tasklist cursors fix that: a list
+    we've never synced has no entry in sync_state_tasklist, so the engine
+    treats it as a full pull.
+    """
+
+    eng, h, g, store, clock = _multi_engine(tmp_path, (_PERSONAL,))
+    # Seed Personal and run a cycle so the pair has a non-trivial cursor.
+    g.insert_task("tl-personal", title="Existing personal")
+    eng.run_once()
+    assert len(h._store) == 1
+
+    # Add an OLD task to a list the engine has never seen before, with a
+    # backdated `updated` so the legacy per-pair cursor would skip it.
+    work_bucket = g._bucket("tl-work")
+    work_bucket["g-old"] = {
+        "id": "g-old", "etag": "e", "title": "Old work task", "notes": "",
+        "status": "needsAction", "due": None, "completed": None,
+        "updated": "2000-01-01T00:00:00.000Z", "deleted": False, "hidden": False,
+    }
+    # Reconstruct engine to mimic a config change + restart with WORK added.
+    eng = SyncEngine(_multi_pair((_PERSONAL, _WORK)), h, g, store)
+    eng.run_once()
+    # We should have pulled "Old work task" into Habitica.
+    titles = {t["text"] for t in h._store.values()}
+    assert "Old work task" in titles
+
+
 def test_multi_list_reuses_existing_habitica_tag(tmp_path: Path):
     """If the user already has a tag of the right name, we shouldn't create a duplicate."""
     eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
