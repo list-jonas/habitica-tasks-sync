@@ -173,7 +173,7 @@ def test_multi_tasklists_parsing(tmp_path: Path):
     assert g.tasklists[2].tasklist_id == "explicitlistid"
 
 
-def test_multi_tasklists_requires_tag_when_no_title(tmp_path: Path):
+def test_multi_tasklists_untagged_entry_must_be_first(tmp_path: Path):
     cfg = _write(
         tmp_path,
         """
@@ -187,10 +187,56 @@ def test_multi_tasklists_requires_tag_when_no_title(tmp_path: Path):
               tasklists:
                 - title: Personal
                   tag: personal
-                - id: anotherid
+                - id: anotherid  # no title, no tag → untagged but not first
         """,
     )
-    with pytest.raises(ConfigError, match="tag.*required"):
+    with pytest.raises(ConfigError, match="untagged tasklist must be the first"):
+        load_config(cfg)
+
+
+def test_multi_tasklists_explicit_untagged_first_entry_ok(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklists:
+                - title: Personal
+                  tag: null          # the untagged sink
+                - title: UNI
+                  tag: uni
+        """,
+    )
+    config = load_config(cfg)
+    tl = config.pairs[0].google.tasklists
+    assert tl[0].tag is None
+    assert tl[1].tag == "uni"
+
+
+def test_multi_tasklists_rejects_multiple_untagged(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklists:
+                - title: Personal
+                  tag: null
+                - title: UNI
+                  tag: ""
+        """,
+    )
+    with pytest.raises(ConfigError, match="at most one entry may be untagged"):
         load_config(cfg)
 
 

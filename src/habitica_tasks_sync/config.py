@@ -247,24 +247,50 @@ def _parse_tasklists(g: dict[str, Any], *, pair_index: int) -> tuple[TasklistCon
                 raise ConfigError(f"pairs[{pair_index}].google.tasklists[{j}] must be a mapping")
             tid = raw.get("tasklist_id") or raw.get("id")
             ttitle = raw.get("tasklist_title") or raw.get("title")
-            tag = raw.get("tag")
             tid_s = str(tid).strip() if tid is not None else None
             ttitle_s = str(ttitle).strip() if ttitle is not None else None
-            tag_s = str(tag).strip() if tag is not None else None
             if not tid_s and not ttitle_s:
                 raise ConfigError(
                     f"pairs[{pair_index}].google.tasklists[{j}] must set `title` or `tasklist_id`"
                 )
-            if len(multi) > 1 and not tag_s:
-                # Fall back to title as tag for convenience; only error if
-                # we genuinely cannot derive a unique tag.
+
+            # Tag handling has three states:
+            #   - `tag:` key absent → fall back to title (in multi-list mode)
+            #   - `tag: <name>` → use the given name verbatim
+            #   - `tag: null` or `tag: ""` → opt OUT of tagging; this list
+            #     becomes the "untagged sink" for tasks without any
+            #     routing tag. Only allowed on the first entry.
+            tag_key_set = "tag" in raw
+            tag_raw = raw.get("tag")
+            tag_s: str | None
+            if tag_key_set:
+                if tag_raw is None or str(tag_raw).strip() == "":
+                    tag_s = None  # explicit untagged
+                else:
+                    tag_s = str(tag_raw).strip()
+            elif len(multi) > 1 and ttitle_s:
+                # Convenience: fall back to title for multi-list entries
+                # that didn't bother setting `tag`. Preserves the old
+                # "tag defaults to title" behaviour.
                 tag_s = ttitle_s
-            if len(multi) > 1 and not tag_s:
-                raise ConfigError(
-                    f"pairs[{pair_index}].google.tasklists[{j}]: `tag` is required when "
-                    f"more than one tasklist is configured (no title to fall back on)."
-                )
+            else:
+                tag_s = None
             entries.append(TasklistConfig(tasklist_id=tid_s, tasklist_title=ttitle_s, tag=tag_s))
+
+        if len(entries) > 1:
+            untagged_positions = [j for j, e in enumerate(entries) if not e.tag]
+            if len(untagged_positions) > 1:
+                raise ConfigError(
+                    f"pairs[{pair_index}].google.tasklists: at most one entry may be "
+                    f"untagged (opt out with `tag: null`); got "
+                    f"{len(untagged_positions)} untagged entries."
+                )
+            if untagged_positions and untagged_positions[0] != 0:
+                raise ConfigError(
+                    f"pairs[{pair_index}].google.tasklists: the untagged tasklist "
+                    f"must be the first entry — it acts as the default sink for "
+                    f"tasks without a routing tag."
+                )
         # Uniqueness checks.
         seen_tags: set[str] = set()
         seen_ids: set[str] = set()

@@ -778,6 +778,55 @@ def test_legacy_pair_cursor_bootstraps_known_tasklist(tmp_path: Path):
     assert stats.created_in_habitica == 0
 
 
+_UNTAGGED_DEFAULT = TasklistConfig(tasklist_id="tl-default", tasklist_title=None, tag=None)
+_UNI = TasklistConfig(tasklist_id="tl-uni", tasklist_title=None, tag="uni")
+
+
+def test_untagged_default_does_not_tag_new_habitica_tasks(tmp_path: Path):
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_UNTAGGED_DEFAULT, _UNI))
+    g.insert_task("tl-default", title="From default list")
+    g.insert_task("tl-uni", title="From UNI list")
+    eng.run_once()
+
+    by_title = {t["text"]: t for t in h._store.values()}
+    default_h = by_title["From default list"]
+    uni_h = by_title["From UNI list"]
+    # The default-list task gets no Habitica tag.
+    assert default_h["tags"] == []
+    # The UNI-list task picks up the uni tag.
+    uni_tag = _tag_id(h, "uni")
+    assert uni_tag in uni_h["tags"]
+
+
+def test_untagged_habitica_task_routes_to_default_without_attaching_tag(tmp_path: Path):
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_UNTAGGED_DEFAULT, _UNI))
+    ht = h.create_todo(text="Pure habitica task")
+    eng.run_once()
+    # Should land in tl-default and the Habitica task should stay untagged.
+    assert len(g._bucket("tl-default")) == 1
+    assert len(g._bucket("tl-uni")) == 0
+    assert h._store[ht.id]["tags"] == []
+
+
+def test_removing_tag_moves_task_back_to_untagged_default(tmp_path: Path):
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_UNTAGGED_DEFAULT, _UNI))
+    eng._resolve_routing()
+    uni_tag = _tag_id(h, "uni")
+    ht = h.create_todo(text="Studying", tags=[uni_tag])
+    eng.run_once()
+    assert len(g._bucket("tl-uni")) == 1
+    # User removes the uni tag entirely.
+    h._store[ht.id]["tags"] = []
+    h._store[ht.id]["updatedAt"] = h.clock.tick()
+    stats = eng.run_once()
+    assert stats.moved_in_google == 1
+    uni_live = [r for r in g._bucket("tl-uni").values() if not r.get("deleted")]
+    default_live = [r for r in g._bucket("tl-default").values() if not r.get("deleted")]
+    assert uni_live == []
+    assert len(default_live) == 1
+    assert h._store[ht.id]["tags"] == []  # still no list-tag attached
+
+
 def test_multi_list_reuses_existing_habitica_tag(tmp_path: Path):
     """If the user already has a tag of the right name, we shouldn't create a duplicate."""
     eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))

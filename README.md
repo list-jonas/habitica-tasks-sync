@@ -148,18 +148,37 @@ Routing rules:
 - Each list pairs with one Habitica tag. Tags (and lists) are created on
   first sync if they don't exist yet. Existing Habitica tags are matched
   case-insensitively.
+- The **first** entry can opt out of tagging with `tag: null` (or
+  `tag: ""`). It becomes the "untagged sink": tasks in that Google list
+  are mirrored to Habitica with no list-tag attached, and Habitica
+  tasks that carry none of the other configured tags land in it.
+  Useful when you want most of your Habitica todos to stay free of
+  routing tags but still want a separate list (UNI, Work, …) routed by
+  tag.
 - A new Google task is created in Habitica with the source list's tag
   attached.
 - A new Habitica task ends up in the Google list whose tag is on the
   task. If none of the configured tags are present, the task lands in
-  the first configured list and that list's tag is added back to the
-  Habitica task so the next cycle is deterministic.
+  the first configured list (and that list's tag is added back to the
+  Habitica task — unless the first entry is the untagged sink, in
+  which case no tag is attached).
 - Changing the tag on an existing Habitica task migrates the matching
   Google task to the new list (delete on the old, recreate on the new —
-  Google Tasks has no cross-list move).
+  Google Tasks has no cross-list move). Removing the last routing tag
+  migrates the task back to the default list.
 - Adoption-by-title on first sync only collapses tasks within the same
   configured list, so a "Personal" Habitica todo won't be merged into a
   same-named "Work" Google task by mistake.
+
+```yaml
+# Example: keep everyday Habitica todos untagged, route only UNI tasks.
+google:
+  tasklists:
+    - tasklist_id: "@default"   # Google's default list, the untagged sink
+      tag: null                  # explicit opt-out
+    - title: "UNI"
+      tag: "uni"
+```
 
 ## Environment variables in config
 

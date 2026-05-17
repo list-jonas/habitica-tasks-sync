@@ -409,8 +409,14 @@ class SyncEngine:
             # now point at a different configured list than the mapping
             # records. If so, migrate before doing the regular sync.
             if routing.is_multi_list:
-                intended = self._intended_tasklist_for_habitica(h, routing)
-                if intended is not None and intended != (mapping.google_tasklist or routing.default_tasklist_id):
+                # "No matching tag" resolves to the default list, which
+                # is the untagged sink when its tag is null/empty. This
+                # means removing a routing tag from a Habitica task
+                # migrates it back to the default list — symmetric with
+                # adding a tag migrating it forward.
+                intended = self._intended_tasklist_for_habitica(h, routing) or routing.default_tasklist_id
+                current = mapping.google_tasklist or routing.default_tasklist_id
+                if intended != current:
                     try:
                         result = self._migrate_google_to_list(h, g, mapping, intended, routing, stats)
                         if result is not None:
