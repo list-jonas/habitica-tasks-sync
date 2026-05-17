@@ -549,6 +549,29 @@ def test_habitica_task_without_tag_routes_to_default_and_gets_tagged(tmp_path: P
     assert personal_tag in h._store[ht.id]["tags"]
 
 
+def test_move_drops_old_list_tag(tmp_path: Path):
+    """A move triggered by adding a new tag should also strip the old
+    list's tag, otherwise routing is non-deterministic next time tags
+    are reordered."""
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    ht = h.create_todo(text="Project plan")
+    eng.run_once()  # routed to personal; personal tag now attached
+    personal_tag = _tag_id(h, "personal")
+    work_tag = _tag_id(h, "work")
+    assert personal_tag in h._store[ht.id]["tags"]
+
+    # User adds the work tag WITHOUT removing personal.
+    raw = h._store[ht.id]
+    raw["tags"] = [work_tag, personal_tag]
+    raw["updatedAt"] = h.clock.tick()
+
+    stats = eng.run_once()
+    assert stats.moved_in_google == 1
+    # Old (personal) tag stripped after the move.
+    assert personal_tag not in h._store[ht.id]["tags"]
+    assert work_tag in h._store[ht.id]["tags"]
+
+
 def test_move_between_lists_when_tag_changes(tmp_path: Path):
     eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
     ht = h.create_todo(text="Project plan")

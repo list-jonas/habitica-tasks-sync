@@ -391,9 +391,10 @@ class SyncEngine:
                 intended = self._intended_tasklist_for_habitica(h, routing)
                 if intended is not None and intended != (mapping.google_tasklist or routing.default_tasklist_id):
                     try:
-                        new_g = self._migrate_google_to_list(h, g, mapping, intended, stats)
-                        if new_g is not None:
-                            g = new_g
+                        result = self._migrate_google_to_list(h, g, mapping, intended, routing, stats)
+                        if result is not None:
+                            g, h = result
+                            h_by_id[h.id] = h
                             mapping = self.store.get_by_habitica(self.pair.name, h.id) or mapping
                     except Exception as exc:  # noqa: BLE001
                         stats.errors += 1
@@ -481,7 +482,7 @@ class SyncEngine:
             self.h.score_todo(h.id, complete=canonical.completed)
         # If the Habitica task is missing the tag for its source list, attach it.
         # _ensure_habitica_has_tasklist_tag re-fetches when it adds a tag.
-        if routing.is_multi_list:
+        if routing.tag_id_for_tasklist(tasklist_id) is not None:
             self._ensure_habitica_has_tasklist_tag(h, tasklist_id, routing)
         refreshed = self.h.get_todo(h.id) or h
         stats.updated_in_habitica += 1
@@ -495,14 +496,22 @@ class SyncEngine:
         g: GoogleTask,
         mapping: TaskMapping,
         new_tasklist_id: str,
+        routing: TasklistRouting,
         stats: SyncStats,
-    ) -> GoogleTask | None:
+    ) -> tuple[GoogleTask, HabiticaTask] | None:
         """Move a Google task to a different list by recreating it.
 
         Google Tasks has no cross-list move; the only safe path is
-        insert-into-new → update mapping → delete-old, in that order, so a
-        failure on the second step leaves the user with a duplicate (which
-        the user can resolve) rather than a missing task.
+        insert-into-new → update mapping → delete-old, in that order, so
+        a failure on the second step leaves the user with a duplicate
+        (which the user can resolve) rather than a missing task.
+
+        Also strip the OLD list's tag from the Habitica task if it's
+        still attached: leaving stale list-tags around makes routing
+        non-deterministic the next time the user reorders tags.
+
+        Returns the new Google task plus the (potentially refreshed)
+        Habitica task, or None when the old tasklist can't be determined.
         """
 
         old_tasklist = mapping.google_tasklist or g.tasklist_id
@@ -516,6 +525,18 @@ class SyncEngine:
             due_date_iso=canonical.due_date,
             completed=canonical.completed,
         )
+        old_tag_id = routing.tag_id_for_tasklist(old_tasklist)
+        new_tag_id = routing.tag_id_for_tasklist(new_tasklist_id)
+        if old_tag_id and old_tag_id != new_tag_id and old_tag_id in h.tags:
+            try:
+                self.h.remove_tag_from_task(h.id, old_tag_id)
+            except HabiticaError as exc:
+                log.warning("[%s] could not drop old list tag from habitica %s: %s",
+                            self.pair.name, h.id, exc)
+            else:
+                refreshed = self.h.get_todo(h.id)
+                if refreshed is not None:
+                    h = refreshed
         self._record_mapping(h, new_g, new_tasklist_id)
         try:
             self.g.delete_task(old_tasklist, g.id)
@@ -529,7 +550,7 @@ class SyncEngine:
         stats.moved_in_google += 1
         log.info("[%s] moved google task: %s → %s for habitica %s (new id %s)",
                  self.pair.name, old_tasklist, new_tasklist_id, h.id, new_g.id)
-        return new_g
+        return new_g, h
 
     # --- creations ------------------------------------------------------
 
@@ -570,7 +591,7 @@ class SyncEngine:
                 # below reflects Habitica's post-tag `updatedAt`. If we
                 # tagged after recording, the next cycle would see h.updated_at
                 # drift and re-push without any real content change.
-                if routing.is_multi_list:
+                if routing.tag_id_for_tasklist(target_tasklist) is not None:
                     h = self._ensure_habitica_has_tasklist_tag(h, target_tasklist, routing)
                     h_by_id[h.id] = h
                     canonical = h.to_canonical()
