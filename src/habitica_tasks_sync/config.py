@@ -36,17 +36,58 @@ class HabiticaCreds:
 
 
 @dataclass(frozen=True)
+class TasklistConfig:
+    """One Google Tasks list paired with an optional Habitica tag.
+
+    - `tasklist_id`: explicit Google list ID. Highest precedence.
+    - `tasklist_title`: looked up by title; created if missing.
+    - `tag`: Habitica tag name used to route tasks between this list and
+      its Habitica side. Required in multi-list mode (where `tag` is the
+      only way to know which list a Habitica task belongs to); optional
+      in single-list mode (no routing needed).
+    """
+
+    tasklist_id: str | None
+    tasklist_title: str | None
+    tag: str | None  # Habitica tag name; mandatory if more than one list configured
+
+    def display_name(self) -> str:
+        return self.tasklist_title or self.tasklist_id or "@default"
+
+
+@dataclass(frozen=True)
 class GoogleCreds:
     """Credential paths for a single Google account.
 
     `credentials_file` holds the OAuth client (downloaded from Cloud Console).
     `token_file` is produced by `habitica-tasks-sync-auth` and refreshed in place.
+
+    `tasklists` is always at least one entry. The first entry is the
+    "default" list — new Habitica tasks that don't carry any
+    list-tag end up there. In single-list mode the field is just a
+    one-element tuple and the tag is unused.
     """
 
     credentials_file: Path
     token_file: Path
-    tasklist_id: str | None  # if None: use the user's default ("@default")
-    tasklist_title: str | None  # if set, auto-resolve / auto-create by title
+    tasklists: tuple[TasklistConfig, ...]
+
+    @property
+    def is_multi_list(self) -> bool:
+        return len(self.tasklists) > 1
+
+    @property
+    def default_tasklist(self) -> TasklistConfig:
+        return self.tasklists[0]
+
+    # Compat shims for any caller still expecting single-list fields.
+    @property
+    def tasklist_id(self) -> str | None:
+        return self.default_tasklist.tasklist_id
+
+    @property
+    def tasklist_title(self) -> str | None:
+        return self.default_tasklist.tasklist_title
 
     def resolved_tasklist(self) -> str:
         return self.tasklist_id or "@default"
@@ -143,12 +184,7 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
         creds_file = Path(creds_raw).expanduser()
         token_file = Path(token_raw).expanduser()
 
-        tasklist_id = g.get("tasklist_id")
-        tasklist_title = g.get("tasklist_title")
-        if tasklist_id is not None:
-            tasklist_id = str(tasklist_id)
-        if tasklist_title is not None:
-            tasklist_title = str(tasklist_title)
+        tasklists = _parse_tasklists(g, pair_index=i)
 
         pairs.append(
             SyncPair(
@@ -157,8 +193,7 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
                 google=GoogleCreds(
                     credentials_file=creds_file,
                     token_file=token_file,
-                    tasklist_id=tasklist_id,
-                    tasklist_title=tasklist_title,
+                    tasklists=tasklists,
                 ),
             )
         )
@@ -175,6 +210,95 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
         http_timeout_seconds=_to_float(raw.get("http_timeout_seconds", 30.0), "http_timeout_seconds"),
         fail_fast=bool(raw.get("fail_fast", False)),
     )
+
+
+def _parse_tasklists(g: dict[str, Any], *, pair_index: int) -> tuple[TasklistConfig, ...]:
+    """Parse the per-pair google.tasklists list (preferred) or fall back
+    to the legacy single-list fields `tasklist_id` / `tasklist_title`.
+
+    Validation:
+    - At least one tasklist must be specified.
+    - Mixing the legacy fields with `tasklists` raises so the user can't
+      end up wondering which one was used.
+    - In multi-list mode every entry must have a non-empty `tag` so the
+      sync engine can route tasks unambiguously.
+    - No two entries may share the same tag (case-insensitive) or the
+      same explicit `tasklist_id`/`tasklist_title`.
+    """
+
+    multi = g.get("tasklists")
+    legacy_id = g.get("tasklist_id")
+    legacy_title = g.get("tasklist_title")
+    legacy_tag = g.get("tag")
+    has_legacy = legacy_id is not None or legacy_title is not None
+
+    if multi is not None and has_legacy:
+        raise ConfigError(
+            f"pairs[{pair_index}].google: use either `tasklists` (multi-list) "
+            f"or `tasklist_id`/`tasklist_title` (legacy single-list), not both."
+        )
+
+    if multi is not None:
+        if not isinstance(multi, list) or not multi:
+            raise ConfigError(f"pairs[{pair_index}].google.tasklists must be a non-empty list")
+        entries: list[TasklistConfig] = []
+        for j, raw in enumerate(multi):
+            if not isinstance(raw, dict):
+                raise ConfigError(f"pairs[{pair_index}].google.tasklists[{j}] must be a mapping")
+            tid = raw.get("tasklist_id") or raw.get("id")
+            ttitle = raw.get("tasklist_title") or raw.get("title")
+            tag = raw.get("tag")
+            tid_s = str(tid).strip() if tid is not None else None
+            ttitle_s = str(ttitle).strip() if ttitle is not None else None
+            tag_s = str(tag).strip() if tag is not None else None
+            if not tid_s and not ttitle_s:
+                raise ConfigError(
+                    f"pairs[{pair_index}].google.tasklists[{j}] must set `title` or `tasklist_id`"
+                )
+            if len(multi) > 1 and not tag_s:
+                # Fall back to title as tag for convenience; only error if
+                # we genuinely cannot derive a unique tag.
+                tag_s = ttitle_s
+            if len(multi) > 1 and not tag_s:
+                raise ConfigError(
+                    f"pairs[{pair_index}].google.tasklists[{j}]: `tag` is required when "
+                    f"more than one tasklist is configured (no title to fall back on)."
+                )
+            entries.append(TasklistConfig(tasklist_id=tid_s, tasklist_title=ttitle_s, tag=tag_s))
+        # Uniqueness checks.
+        seen_tags: set[str] = set()
+        seen_ids: set[str] = set()
+        seen_titles: set[str] = set()
+        for j, e in enumerate(entries):
+            if e.tag:
+                key = e.tag.casefold()
+                if key in seen_tags:
+                    raise ConfigError(
+                        f"pairs[{pair_index}].google.tasklists: duplicate tag {e.tag!r}"
+                    )
+                seen_tags.add(key)
+            if e.tasklist_id:
+                if e.tasklist_id in seen_ids:
+                    raise ConfigError(
+                        f"pairs[{pair_index}].google.tasklists: duplicate tasklist_id "
+                        f"{e.tasklist_id!r}"
+                    )
+                seen_ids.add(e.tasklist_id)
+            if e.tasklist_title:
+                key = e.tasklist_title.casefold()
+                if key in seen_titles:
+                    raise ConfigError(
+                        f"pairs[{pair_index}].google.tasklists: duplicate tasklist_title "
+                        f"{e.tasklist_title!r}"
+                    )
+                seen_titles.add(key)
+        return tuple(entries)
+
+    # Legacy single-list path.
+    tid_s = str(legacy_id).strip() if legacy_id is not None else None
+    ttitle_s = str(legacy_title).strip() if legacy_title is not None else None
+    tag_s = str(legacy_tag).strip() if legacy_tag is not None else None
+    return (TasklistConfig(tasklist_id=tid_s, tasklist_title=ttitle_s, tag=tag_s),)
 
 
 def _to_float(value: Any, field: str) -> float:

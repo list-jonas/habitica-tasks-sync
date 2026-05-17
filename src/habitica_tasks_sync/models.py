@@ -73,6 +73,7 @@ class HabiticaTask:
     alias: str | None = None
     challenge_id: str | None = None  # set if task belongs to a challenge
     group_id: str | None = None  # set if task is a group/party task
+    tags: list[str] = field(default_factory=list)  # Habitica tag IDs
 
     @property
     def is_managed_externally(self) -> bool:
@@ -99,6 +100,7 @@ class HabiticaTask:
             alias=data.get("alias"),
             challenge_id=(challenge.get("id") if isinstance(challenge, dict) else None),
             group_id=(group.get("id") if isinstance(group, dict) else None),
+            tags=[str(t) for t in (data.get("tags") or []) if t],
         )
 
     def to_canonical(self) -> CanonicalTask:
@@ -132,9 +134,13 @@ class GoogleTask:
     hidden: bool = False
     parent: str | None = None
     position: str = ""
+    # Populated by the client / sync engine; not part of the Google API
+    # response. Lets the engine route updates and deletes back to the
+    # right list when more than one is configured.
+    tasklist_id: str = ""
 
     @classmethod
-    def from_api(cls, data: dict[str, Any]) -> GoogleTask:
+    def from_api(cls, data: dict[str, Any], *, tasklist_id: str = "") -> GoogleTask:
         return cls(
             id=data.get("id", ""),
             etag=data.get("etag", "") or "",
@@ -148,6 +154,7 @@ class GoogleTask:
             hidden=bool(data.get("hidden", False)),
             parent=data.get("parent"),
             position=data.get("position", "") or "",
+            tasklist_id=tasklist_id,
         )
 
     def to_canonical(self, checklist: tuple[ChecklistItem, ...] = ()) -> CanonicalTask:

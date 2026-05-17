@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 import pytest
 
-from habitica_tasks_sync.config import GoogleCreds, HabiticaCreds, SyncPair
+from habitica_tasks_sync.config import GoogleCreds, HabiticaCreds, SyncPair, TasklistConfig
 from habitica_tasks_sync.db import StateStore
 from habitica_tasks_sync.models import GoogleTask, HabiticaTask
 from habitica_tasks_sync.sync import SyncEngine, _strip_checklist_artifact, _title_key
@@ -189,8 +189,7 @@ def _pair() -> SyncPair:
         google=GoogleCreds(
             credentials_file=Path("/tmp/c.json"),
             token_file=Path("/tmp/t.json"),
-            tasklist_id="tl1",
-            tasklist_title=None,
+            tasklists=(TasklistConfig(tasklist_id="tl1", tasklist_title=None, tag=None),),
         ),
     )
 

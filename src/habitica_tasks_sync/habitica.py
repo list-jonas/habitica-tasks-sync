@@ -210,6 +210,7 @@ class HabiticaClient:
         due_date_iso: str | None = None,
         checklist: Iterable[dict[str, Any]] = (),
         alias: str | None = None,
+        tags: Iterable[str] = (),
     ) -> HabiticaTask:
         body: dict[str, Any] = {"type": "todo", "text": text or "(untitled)", "notes": notes or ""}
         if due_date_iso:
@@ -219,6 +220,9 @@ class HabiticaClient:
             body["checklist"] = cl
         if alias:
             body["alias"] = alias
+        tag_list = [t for t in (str(x) for x in tags) if t]
+        if tag_list:
+            body["tags"] = tag_list
         data = self._request("POST", "/tasks/user", json=body)
         return HabiticaTask.from_api(data)
 
@@ -259,6 +263,33 @@ class HabiticaClient:
         except HabiticaError as exc:
             if exc.status == 404:
                 return False
+            raise
+
+    # --- tags -----------------------------------------------------------
+
+    def list_tags(self) -> list[dict[str, Any]]:
+        return self._request("GET", "/tags") or []
+
+    def create_tag(self, name: str) -> dict[str, Any]:
+        return self._request("POST", "/tags", json={"name": name}) or {}
+
+    def add_tag_to_task(self, task_id: str, tag_id: str) -> None:
+        """Attach a tag to a task. Habitica returns 400 if already attached;
+        treat that as a no-op so callers can be idempotent."""
+
+        try:
+            self._request("POST", f"/tasks/{task_id}/tags/{tag_id}")
+        except HabiticaError as exc:
+            if exc.status == 400:
+                return
+            raise
+
+    def remove_tag_from_task(self, task_id: str, tag_id: str) -> None:
+        try:
+            self._request("DELETE", f"/tasks/{task_id}/tags/{tag_id}")
+        except HabiticaError as exc:
+            if exc.status in (400, 404):
+                return
             raise
 
     # --- checklist ------------------------------------------------------

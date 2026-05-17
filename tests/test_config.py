@@ -144,6 +144,119 @@ def test_duplicate_pair_names(tmp_path: Path):
         load_config(cfg)
 
 
+def test_multi_tasklists_parsing(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklists:
+                - title: Personal
+                  tag: personal
+                - title: Work
+                - id: explicitlistid
+                  tag: archive
+        """,
+    )
+    config = load_config(cfg)
+    g = config.pairs[0].google
+    assert g.is_multi_list
+    assert len(g.tasklists) == 3
+    assert g.tasklists[0].tag == "personal"
+    # Tag falls back to title when omitted.
+    assert g.tasklists[1].tag == "Work"
+    assert g.tasklists[2].tasklist_id == "explicitlistid"
+
+
+def test_multi_tasklists_requires_tag_when_no_title(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklists:
+                - title: Personal
+                  tag: personal
+                - id: anotherid
+        """,
+    )
+    with pytest.raises(ConfigError, match="tag.*required"):
+        load_config(cfg)
+
+
+def test_multi_tasklists_rejects_duplicate_tag(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklists:
+                - title: A
+                  tag: shared
+                - title: B
+                  tag: SHARED
+        """,
+    )
+    with pytest.raises(ConfigError, match="duplicate tag"):
+        load_config(cfg)
+
+
+def test_legacy_and_tasklists_mixed_rejected(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklist_title: Habitica
+              tasklists:
+                - title: A
+                  tag: a
+        """,
+    )
+    with pytest.raises(ConfigError, match="either.*tasklists"):
+        load_config(cfg)
+
+
+def test_legacy_single_list_still_works(tmp_path: Path):
+    cfg = _write(
+        tmp_path,
+        """
+        user_agent: {uuid: 12345678-1234-1234-1234-123456789abc}
+        pairs:
+          - name: alice
+            habitica: {user_id: 11111111-2222-3333-4444-555555555555, api_token: 99999999-2222-3333-4444-555555555555}
+            google:
+              credentials_file: /tmp/c.json
+              token_file: /tmp/t.json
+              tasklist_title: Habitica
+        """,
+    )
+    config = load_config(cfg)
+    g = config.pairs[0].google
+    assert not g.is_multi_list
+    assert g.tasklist_title == "Habitica"
+
+
 def test_non_numeric_interval(tmp_path: Path):
     cfg = _write(
         tmp_path,
