@@ -13,6 +13,9 @@ ignored: they map awkwardly onto Google Tasks (which only knows todos).
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from collections import deque
 from typing import Any, Iterable
 
 import httpx
@@ -28,6 +31,43 @@ from .models import HabiticaTask, date_to_habitica_due
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://habitica.com/api/v3"
+
+
+class _RateLimiter:
+    """Sliding-window rate limiter for the Habitica 30-req/60-s budget.
+
+    We pace ourselves *before* sending so a long initial sync never hits
+    a 429. The window holds the timestamps of the last `max_per_window`
+    successful sends; if we're about to exceed it, we sleep until the
+    oldest one ages out. A small safety margin (default 28 instead of
+    30) absorbs clock skew, retried-after-429 traffic, and the fact
+    that Habitica counts the request before our retry wrapper sees the
+    response.
+    """
+
+    def __init__(self, max_per_window: int = 28, window_seconds: float = 60.0) -> None:
+        self._max = max_per_window
+        self._window = window_seconds
+        self._timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self._window
+            while self._timestamps and self._timestamps[0] <= cutoff:
+                self._timestamps.popleft()
+            if len(self._timestamps) >= self._max:
+                sleep_for = self._timestamps[0] + self._window - now
+                if sleep_for > 0:
+                    log.info("habitica self-pacing: %d/%d in last %.0fs — sleeping %.1fs",
+                             len(self._timestamps), self._max, self._window, sleep_for)
+                    time.sleep(sleep_for + 0.05)
+                    now = time.monotonic()
+                    cutoff = now - self._window
+                    while self._timestamps and self._timestamps[0] <= cutoff:
+                        self._timestamps.popleft()
+            self._timestamps.append(now)
 
 
 class HabiticaError(RuntimeError):
@@ -84,10 +124,12 @@ class HabiticaClient:
         app_name: str,
         timeout: float = 30.0,
         base_url: str = BASE_URL,
+        rate_limit_per_minute: int = 28,
     ) -> None:
         if not user_id or not api_token:
             raise HabiticaError("Habitica user_id and api_token are required")
         self._user_id = user_id
+        self._rate_limiter = _RateLimiter(max_per_window=rate_limit_per_minute)
         # `x-client` is parsed by Habitica as `<UUID>-<AppName>` on the
         # FIRST hyphen after the UUID; spaces or commas in the app name
         # have triggered 400s in past Habitica versions, so sanitize.
@@ -127,11 +169,21 @@ class HabiticaClient:
         reraise=True,
     )
     def _request(self, method: str, path: str, *, json: Any = None, params: dict[str, Any] | None = None) -> Any:
+        # Self-pace BEFORE the request. tenacity handles the 429-fallback
+        # cleanly, but a 429 still costs us a wasted call against the
+        # global quota and the user gets a noisy WARNING line.
+        self._rate_limiter.acquire()
         try:
             resp = self._http.request(method, path, json=json, params=params)
         except _RETRYABLE_NETWORK as exc:
             log.warning("habitica network error on %s %s: %s", method, path, exc)
             raise
+        # Trust the server's own counters when present: if we're down to
+        # the last slot or two, sleep until the window resets so the next
+        # call doesn't 429. This catches drift between our local pacing
+        # and the server's view of the world (clock skew, other
+        # processes on the same IP, etc.).
+        self._respect_rate_limit_headers(resp)
 
         if resp.status_code == 429:
             # Honor Retry-After when present; default to 5 s. We only stash
@@ -328,6 +380,63 @@ class HabiticaClient:
         if data is None:
             return None
         return HabiticaTask.from_api(data)
+
+
+    def _respect_rate_limit_headers(self, resp: httpx.Response) -> None:
+        """Pause if Habitica's headers say we have almost no budget left.
+
+        Habitica returns `X-RateLimit-Remaining` (int) and
+        `X-RateLimit-Reset` (RFC1123 / ISO / epoch — implementation
+        varies, so we try a few parses). When `remaining <= 1` we sleep
+        until reset so the next request gets a fresh slot.
+        """
+
+        remaining = resp.headers.get("x-ratelimit-remaining")
+        reset = resp.headers.get("x-ratelimit-reset")
+        if remaining is None:
+            return
+        try:
+            rem_n = int(remaining)
+        except (TypeError, ValueError):
+            return
+        if rem_n > 1:
+            return
+        wait = _parse_rate_limit_reset(reset)
+        if wait is None or wait <= 0:
+            return
+        # Cap to one minute; Habitica's window is 60s, and any value
+        # beyond that is a clock-skew artifact.
+        wait = min(wait, 60.0) + 0.25
+        log.info("habitica budget low (remaining=%s) — sleeping %.1fs until reset", rem_n, wait)
+        time.sleep(wait)
+
+
+def _parse_rate_limit_reset(value: str | None) -> float | None:
+    """Return seconds to wait for the reset moment indicated by `value`.
+
+    Habitica has historically sent X-RateLimit-Reset as an epoch
+    seconds value but other deployments use milliseconds or
+    seconds-from-now. Try each parse and pick the one that yields a
+    plausible future time (≤ 60s away).
+    """
+
+    if not value:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    now = time.time()
+    # Epoch seconds in the near future.
+    if 0 < n - now <= 120:
+        return n - now
+    # Epoch milliseconds.
+    if 0 < (n / 1000.0) - now <= 120:
+        return (n / 1000.0) - now
+    # Seconds-from-now.
+    if 0 < n <= 120:
+        return n
+    return None
 
 
 def _sanitize_checklist_item(item: dict[str, Any]) -> dict[str, Any]:
