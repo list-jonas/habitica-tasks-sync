@@ -140,24 +140,58 @@ class StubHabitica:
 @dataclass
 class StubGoogle:
     clock: _Clock = field(default_factory=_Clock)
-    _store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # tasklist_id -> { task_id -> raw }
+    _store: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    # tasklist_title -> tasklist_id (for resolve_tasklist)
+    _titles: dict[str, str] = field(default_factory=dict)
+
+    def _bucket(self, tasklist: str) -> dict[str, dict[str, Any]]:
+        return self._store.setdefault(tasklist, {})
+
+    @property
+    def _all(self) -> dict[str, dict[str, Any]]:
+        """Flat (task_id -> raw) view across every tasklist for test convenience."""
+
+        flat: dict[str, dict[str, Any]] = {}
+        for bucket in self._store.values():
+            flat.update(bucket)
+        return flat
+
+    def _find(self, task_id: str) -> tuple[str, dict[str, Any]] | None:
+        for tlid, bucket in self._store.items():
+            raw = bucket.get(task_id)
+            if raw is not None:
+                return tlid, raw
+        return None
 
     # API surface used by SyncEngine -------------------------------------
 
     def resolve_tasklist(self, *, tasklist_id: str | None, title: str | None) -> str:
-        return tasklist_id or "default"
+        if tasklist_id:
+            self._bucket(tasklist_id)
+            return tasklist_id
+        if title:
+            existing = self._titles.get(title)
+            if existing:
+                return existing
+            new_id = f"tl-{uuid.uuid4().hex[:6]}"
+            self._titles[title] = new_id
+            self._bucket(new_id)
+            return new_id
+        self._bucket("@default")
+        return "@default"
 
     def list_tasks(self, tasklist: str, *, updated_min=None, **_) -> list[GoogleTask]:
         out: list[GoogleTask] = []
-        for raw in self._store.values():
+        for raw in self._bucket(tasklist).values():
             if updated_min and raw["updated"] < updated_min:
                 continue
-            out.append(GoogleTask.from_api(raw))
+            out.append(GoogleTask.from_api(raw, tasklist_id=tasklist))
         return out
 
     def get_task(self, tasklist: str, task_id: str) -> GoogleTask | None:
-        raw = self._store.get(task_id)
-        return GoogleTask.from_api(raw) if raw else None
+        raw = self._bucket(tasklist).get(task_id)
+        return GoogleTask.from_api(raw, tasklist_id=tasklist) if raw else None
 
     def insert_task(
         self, tasklist: str, *, title: str, notes: str = "",
@@ -173,15 +207,15 @@ class StubGoogle:
             "completed": now if completed else None,
             "updated": now, "deleted": False, "hidden": False,
         }
-        self._store[new_id] = raw
-        return GoogleTask.from_api(raw)
+        self._bucket(tasklist)[new_id] = raw
+        return GoogleTask.from_api(raw, tasklist_id=tasklist)
 
     def patch_task(
         self, tasklist: str, task_id: str, *, title: str | None = None,
         notes: str | None = None, due_date_iso: str | None = None,
         clear_due: bool = False, completed: bool | None = None,
     ) -> GoogleTask:
-        raw = self._store[task_id]
+        raw = self._bucket(tasklist)[task_id]
         if title is not None:
             raw["title"] = title
         if notes is not None:
@@ -197,10 +231,10 @@ class StubGoogle:
             raw["status"] = "needsAction"
             raw["completed"] = None
         raw["updated"] = self.clock.tick()
-        return GoogleTask.from_api(raw)
+        return GoogleTask.from_api(raw, tasklist_id=tasklist)
 
     def delete_task(self, tasklist: str, task_id: str) -> bool:
-        raw = self._store.get(task_id)
+        raw = self._bucket(tasklist).get(task_id)
         if raw is None:
             return False
         raw["deleted"] = True
@@ -235,6 +269,30 @@ def _engine(tmp_path: Path):
     return eng, h, g, store, clock
 
 
+def _multi_pair(tasklists: tuple[TasklistConfig, ...]) -> SyncPair:
+    return SyncPair(
+        name="alice",
+        habitica=HabiticaCreds(
+            user_id="11111111-2222-3333-4444-555555555555",
+            api_token="99999999-2222-3333-4444-555555555555",
+        ),
+        google=GoogleCreds(
+            credentials_file=Path("/tmp/c.json"),
+            token_file=Path("/tmp/t.json"),
+            tasklists=tasklists,
+        ),
+    )
+
+
+def _multi_engine(tmp_path: Path, tasklists: tuple[TasklistConfig, ...]):
+    clock = _Clock()
+    h = StubHabitica(clock=clock)
+    g = StubGoogle(clock=clock)
+    store = StateStore(tmp_path / "db.sqlite3")
+    eng = SyncEngine(_multi_pair(tasklists), h, g, store)
+    return eng, h, g, store, clock
+
+
 # --- tests ---------------------------------------------------------------
 
 
@@ -265,7 +323,7 @@ def test_completion_propagates_habitica_to_google(tmp_path: Path):
     eng.run_once()  # creates google twin
     h.score_todo(ht.id, complete=True)
     eng.run_once()
-    google_task = next(iter(g._store.values()))
+    google_task = next(iter(g._all.values()))
     assert google_task["status"] == "completed"
 
 
@@ -291,14 +349,14 @@ def test_delete_propagates_both_ways(tmp_path: Path):
     eng.run_once()
     # Both mappings cleared, both sides empty.
     assert len(store.list_for_pair("alice")) == 0
-    assert all(raw["deleted"] for raw in g._store.values()) or not g._store
+    assert all(raw["deleted"] for raw in g._all.values()) or not g._all
 
 
 def test_tombstone_blocks_recreate_after_habitica_delete(tmp_path: Path):
     eng, h, g, store, _ = _engine(tmp_path)
     ht = h.create_todo(text="One-shot")
     eng.run_once()
-    google_id = next(iter(g._store))
+    google_id = next(iter(g._all))
     # User deletes on Habitica -> we delete on Google -> paired tombstones.
     h.delete_todo(ht.id)
     eng.run_once()
@@ -323,7 +381,7 @@ def test_tombstone_blocks_recreate_after_google_delete(tmp_path: Path):
     # Defensive scenario: Google flips `deleted` back to false (e.g. user
     # restores from trash). The google-side tombstone should still block
     # resurrection on Habitica.
-    g._store[gt.id]["deleted"] = False
+    g._bucket("tl1")[gt.id]["deleted"] = False
     eng.run_once()
     assert len(h._store) == 0
 
@@ -332,7 +390,7 @@ def test_conflict_resolution_last_writer_wins(tmp_path: Path):
     eng, h, g, _, clock = _engine(tmp_path)
     ht = h.create_todo(text="Original")
     eng.run_once()
-    google_id = next(iter(g._store))
+    google_id = next(iter(g._all))
 
     # Habitica edit first, then Google edit (Google wins by timestamp).
     h.update_todo(ht.id, text="From Habitica")
@@ -340,7 +398,7 @@ def test_conflict_resolution_last_writer_wins(tmp_path: Path):
     stats = eng.run_once()
     assert stats.conflicts_resolved == 1
     assert h._store[ht.id]["text"] == "From Google"
-    assert g._store[google_id]["title"] == "From Google"
+    assert g._all[google_id]["title"] == "From Google"
 
 
 def test_idempotent_when_no_changes(tmp_path: Path):
@@ -367,7 +425,7 @@ def test_checklist_flattens_to_google_notes(tmp_path: Path):
                    {"id": "2", "text": "Passport", "completed": False}],
     )
     eng.run_once()
-    g_task = next(iter(g._store.values()))
+    g_task = next(iter(g._all.values()))
     assert "— Checklist —" in g_task["notes"]
     assert "[x] Tickets" in g_task["notes"]
     assert "[ ] Passport" in g_task["notes"]
@@ -379,7 +437,7 @@ def test_notes_truncated_to_google_limit(tmp_path: Path):
     long_notes = "x" * (GOOGLE_NOTES_MAX + 5000)
     h.create_todo(text="big", notes=long_notes)
     eng.run_once()
-    g_task = next(iter(g._store.values()))
+    g_task = next(iter(g._all.values()))
     assert len(g_task["notes"]) <= GOOGLE_NOTES_MAX
 
 
@@ -388,7 +446,7 @@ def test_title_truncated_to_google_limit(tmp_path: Path):
     eng, h, g, _, _ = _engine(tmp_path)
     h.create_todo(text="x" * (GOOGLE_TITLE_MAX + 100))
     eng.run_once()
-    g_task = next(iter(g._store.values()))
+    g_task = next(iter(g._all.values()))
     assert len(g_task["title"]) <= GOOGLE_TITLE_MAX
 
 
@@ -428,5 +486,142 @@ def test_habitica_completed_beyond_30_cap_not_treated_as_delete(tmp_path: Path):
     stats = eng.run_once()
     # No deletion attempted because get_todo still returns the task.
     assert stats.deleted_in_google == 0
-    g_raw = next(iter(g._store.values()))
+    g_raw = next(iter(g._all.values()))
     assert g_raw.get("deleted", False) is False
+
+
+# --- multi-list / tag routing -------------------------------------------
+
+
+_PERSONAL = TasklistConfig(tasklist_id="tl-personal", tasklist_title=None, tag="personal")
+_WORK = TasklistConfig(tasklist_id="tl-work", tasklist_title=None, tag="work")
+
+
+def _tag_id(h: StubHabitica, name: str) -> str:
+    for t in h._tags.values():
+        if t["name"] == name:
+            return t["id"]
+    raise KeyError(name)
+
+
+def test_multi_list_creates_tags_on_first_sync(tmp_path: Path):
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    eng.run_once()
+    names = {t["name"] for t in h._tags.values()}
+    assert names == {"personal", "work"}
+
+
+def test_google_task_creates_habitica_with_source_tag(tmp_path: Path):
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    g.insert_task("tl-work", title="Quarterly review")
+    eng.run_once()
+    habitica_task = next(iter(h._store.values()))
+    work_tag = _tag_id(h, "work")
+    assert work_tag in habitica_task["tags"]
+    mapping = store.list_for_pair("alice")[0]
+    assert mapping.google_tasklist == "tl-work"
+
+
+def test_habitica_task_routed_by_existing_tag(tmp_path: Path):
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    # Seed the work tag first so the Habitica task can carry it on creation.
+    eng._resolve_routing()
+    work_tag = _tag_id(h, "work")
+    h.create_todo(text="Pay quarterly tax", tags=[work_tag])
+    eng.run_once()
+    work_bucket = g._bucket("tl-work")
+    personal_bucket = g._bucket("tl-personal")
+    assert len(work_bucket) == 1
+    assert len(personal_bucket) == 0
+    mapping = store.list_for_pair("alice")[0]
+    assert mapping.google_tasklist == "tl-work"
+
+
+def test_habitica_task_without_tag_routes_to_default_and_gets_tagged(tmp_path: Path):
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    ht = h.create_todo(text="Buy milk")
+    eng.run_once()
+    # Default list = first configured (personal). Task should appear there
+    # and the personal tag should be back-attached to the Habitica task.
+    assert len(g._bucket("tl-personal")) == 1
+    assert len(g._bucket("tl-work")) == 0
+    personal_tag = _tag_id(h, "personal")
+    assert personal_tag in h._store[ht.id]["tags"]
+
+
+def test_move_between_lists_when_tag_changes(tmp_path: Path):
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    ht = h.create_todo(text="Project plan")
+    eng.run_once()  # lands in personal (default)
+    assert len(g._bucket("tl-personal")) == 1
+    personal_tag = _tag_id(h, "personal")
+    work_tag = _tag_id(h, "work")
+
+    # User retags the task in Habitica: drop personal, add work.
+    raw = h._store[ht.id]
+    raw["tags"] = [work_tag]
+    raw["updatedAt"] = h.clock.tick()
+
+    stats = eng.run_once()
+    assert stats.moved_in_google == 1
+    # Old list now has a deleted-marker entry; new list has a live task.
+    personal_live = [r for r in g._bucket("tl-personal").values() if not r.get("deleted")]
+    assert personal_live == []
+    work_live = [r for r in g._bucket("tl-work").values() if not r.get("deleted")]
+    assert len(work_live) == 1
+    mapping = store.list_for_pair("alice")[0]
+    assert mapping.google_tasklist == "tl-work"
+
+
+def test_multi_list_adoption_only_within_same_list(tmp_path: Path):
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    # Make sure tags exist + cache them.
+    eng._resolve_routing()
+    work_tag = _tag_id(h, "work")
+    # Habitica side: task tagged work.
+    h.create_todo(text="Refactor", tags=[work_tag])
+    # Google side: title-matching task BUT in personal list.
+    g.insert_task("tl-personal", title="refactor")
+    eng.run_once()
+    # Should NOT have adopted; instead two separate mappings exist.
+    mappings = store.list_for_pair("alice")
+    assert len(mappings) == 2
+    # Habitica gained a personal-task pulled from Google.
+    assert any(_tag_id(h, "personal") in t["tags"] for t in h._store.values())
+
+
+def test_multi_list_idempotent_second_cycle(tmp_path: Path):
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    g.insert_task("tl-work", title="Item A")
+    h.create_todo(text="Item B")  # untagged → default (personal)
+    eng.run_once()
+    stats = eng.run_once()
+    assert stats.created_in_google == 0
+    assert stats.created_in_habitica == 0
+    assert stats.updated_in_google == 0
+    assert stats.updated_in_habitica == 0
+    assert stats.moved_in_google == 0
+
+
+def test_multi_list_delete_propagates_with_correct_tasklist(tmp_path: Path):
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    gt = g.insert_task("tl-work", title="Doomed")
+    eng.run_once()
+    habitica_id = next(iter(h._store))
+    h.delete_todo(habitica_id)
+    eng.run_once()
+    # The Google task should be marked deleted in the WORK list (its source).
+    assert g._bucket("tl-work")[gt.id]["deleted"] is True
+    assert store.has_tombstone("alice", "google", gt.id)
+
+
+def test_multi_list_reuses_existing_habitica_tag(tmp_path: Path):
+    """If the user already has a tag of the right name, we shouldn't create a duplicate."""
+    eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))
+    # Pre-create the tag (different id casing variants).
+    existing = h.create_tag("Personal")  # different case
+    eng.run_once()
+    names = sorted(t["name"] for t in h._tags.values())
+    # Case-insensitive match: should not create a second "personal" tag.
+    assert names.count("Personal") + names.count("personal") == 1
+    assert "work" in names

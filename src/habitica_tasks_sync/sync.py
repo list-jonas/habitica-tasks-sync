@@ -470,6 +470,7 @@ class SyncEngine:
         if canonical.completed != h.completed:
             self.h.score_todo(h.id, complete=canonical.completed)
         # If the Habitica task is missing the tag for its source list, attach it.
+        # _ensure_habitica_has_tasklist_tag re-fetches when it adds a tag.
         if routing.is_multi_list:
             self._ensure_habitica_has_tasklist_tag(h, tasklist_id, routing)
         refreshed = self.h.get_todo(h.id) or h
@@ -555,13 +556,20 @@ class SyncEngine:
                 # are deterministic).
                 target_tasklist = self._intended_tasklist_for_habitica(h, routing) or routing.default_tasklist_id
 
+                # Attach the routing tag FIRST so the mapping we record
+                # below reflects Habitica's post-tag `updatedAt`. If we
+                # tagged after recording, the next cycle would see h.updated_at
+                # drift and re-push without any real content change.
+                if routing.is_multi_list:
+                    h = self._ensure_habitica_has_tasklist_tag(h, target_tasklist, routing)
+                    h_by_id[h.id] = h
+                    canonical = h.to_canonical()
+
                 adopted = adoption_pool.pop((target_tasklist, _title_key(canonical.title)), None)
                 if adopted is not None:
                     log.info("[%s] adopted existing google task %s for habitica %s (title match %r, list=%s)",
                              self.pair.name, adopted.id, h.id, canonical.title, target_tasklist)
                     self._record_mapping(h, adopted, target_tasklist)
-                    if routing.is_multi_list:
-                        self._ensure_habitica_has_tasklist_tag(h, target_tasklist, routing)
                     continue
 
                 new_g = self.g.insert_task(
@@ -573,8 +581,6 @@ class SyncEngine:
                 )
                 stats.created_in_google += 1
                 self._record_mapping(h, new_g, target_tasklist)
-                if routing.is_multi_list:
-                    self._ensure_habitica_has_tasklist_tag(h, target_tasklist, routing)
                 log.info("[%s] created google task %s for habitica %s (list=%s)",
                          self.pair.name, new_g.id, h.id, target_tasklist)
             except Exception as exc:  # noqa: BLE001
@@ -619,14 +625,11 @@ class SyncEngine:
                 if adopted is not None:
                     log.info("[%s] adopted existing habitica task %s for google %s (title match %r, list=%s)",
                              self.pair.name, adopted.id, g.id, canonical.title, source_tasklist)
-                    self._record_mapping(adopted, g, source_tasklist)
+                    # Tag first so the recorded mapping matches Habitica's
+                    # post-tag updatedAt.
                     if tag_id and tag_id not in adopted.tags:
-                        try:
-                            self.h.add_tag_to_task(adopted.id, tag_id)
-                            adopted.tags.append(tag_id)
-                        except HabiticaError as exc:
-                            log.warning("[%s] could not attach tag %r to habitica %s: %s",
-                                        self.pair.name, tag_name, adopted.id, exc)
+                        adopted = self._ensure_habitica_has_tasklist_tag(adopted, source_tasklist, routing)
+                    self._record_mapping(adopted, g, source_tasklist)
                     continue
 
                 new_h = self.h.create_todo(
@@ -671,18 +674,26 @@ class SyncEngine:
 
     def _ensure_habitica_has_tasklist_tag(
         self, h: HabiticaTask, tasklist_id: str, routing: TasklistRouting
-    ) -> None:
+    ) -> HabiticaTask:
+        """Attach the tag for `tasklist_id` to `h` if missing.
+
+        Returns the refreshed Habitica task (Habitica bumps `updatedAt`
+        on tag changes; callers MUST use the returned task when
+        recording a mapping so the saved `habitica_updated` matches what
+        the next cycle will read back).
+        """
+
         tag_id = routing.tag_id_for_tasklist(tasklist_id)
-        if not tag_id:
-            return
-        if tag_id in h.tags:
-            return
+        if not tag_id or tag_id in h.tags:
+            return h
         try:
             self.h.add_tag_to_task(h.id, tag_id)
-            h.tags.append(tag_id)
         except HabiticaError as exc:
             log.warning("[%s] could not attach tasklist tag to habitica %s: %s",
                         self.pair.name, h.id, exc)
+            return h
+        refreshed = self.h.get_todo(h.id)
+        return refreshed if refreshed is not None else h
 
     # --- mapping persistence -------------------------------------------
 
