@@ -669,6 +669,27 @@ def test_newly_added_tasklist_does_full_initial_pull(tmp_path: Path):
     assert "Old work task" in titles
 
 
+def test_legacy_pair_cursor_bootstraps_known_tasklist(tmp_path: Path):
+    """Upgrading from the pair-level cursor world: a list that already
+    has mappings should reuse the legacy pair cursor rather than doing
+    a wasteful full pull."""
+
+    eng, h, g, store, _ = _multi_engine(tmp_path, (_PERSONAL,))
+    g.insert_task("tl-personal", title="Existing")
+    eng.run_once()
+    # Simulate the upgrade: nuke per-tasklist cursors, keep the pair-level one.
+    store._conn.execute("DELETE FROM sync_state_tasklist")
+    pair_cursor = store.get_last_google_sync("alice")
+    assert pair_cursor is not None
+
+    # Now run another cycle — the bootstrap fallback should kick in and
+    # use the pair cursor for tl-personal (it has mappings).
+    stats = eng.run_once()
+    # No work needed since nothing changed.
+    assert stats.created_in_google == 0
+    assert stats.created_in_habitica == 0
+
+
 def test_multi_list_reuses_existing_habitica_tag(tmp_path: Path):
     """If the user already has a tag of the right name, we shouldn't create a duplicate."""
     eng, h, g, _, _ = _multi_engine(tmp_path, (_PERSONAL, _WORK))

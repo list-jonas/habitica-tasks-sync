@@ -267,14 +267,31 @@ class SyncEngine:
 
         A tasklist with no per-list cursor row gets a full pull so a
         newly-added list (or a first-ever sync) doesn't drop the
-        pre-existing tasks. The cursor is advanced by run_once after a
-        successful cycle, not here.
+        pre-existing tasks.
+
+        Pre-upgrade deployments only have the pair-level cursor; we fall
+        back to it for tasklists that we can prove were synced before
+        (any mapping rows reference them). New lists added in the same
+        upgrade still get a proper full pull because no mapping
+        references them yet.
+
+        The cursor is advanced by run_once after a successful cycle, not
+        here.
         """
 
         new_cursor = overlap_window(datetime.now(timezone.utc), minutes=0)
+        legacy_pair_cursor = None
+        seen_lists: set[str] = set()
+        if not force_full:
+            legacy_pair_cursor = self.store.get_last_google_sync(self.pair.name)
+            for m in self.store.list_for_pair(self.pair.name):
+                if m.google_tasklist:
+                    seen_lists.add(m.google_tasklist)
         all_tasks: list[GoogleTask] = []
         for tlid in routing.tasklist_ids:
             last = None if force_full else self.store.get_last_tasklist_sync(self.pair.name, tlid)
+            if last is None and not force_full and tlid in seen_lists and legacy_pair_cursor:
+                last = legacy_pair_cursor
             cursor_iso: str | None = None
             if last:
                 try:
