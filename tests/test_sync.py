@@ -47,6 +47,7 @@ class _Clock:
 class StubHabitica:
     clock: _Clock = field(default_factory=_Clock)
     _store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _tags: dict[str, dict[str, Any]] = field(default_factory=dict)  # tag_id -> {id,name}
 
     # API surface used by SyncEngine -------------------------------------
 
@@ -65,6 +66,7 @@ class StubHabitica:
     def create_todo(
         self, *, text: str, notes: str = "", due_date_iso: str | None = None,
         checklist: Iterable[dict[str, Any]] = (), alias: str | None = None,
+        tags: Iterable[str] = (),
     ) -> HabiticaTask:
         new_id = f"h-{uuid.uuid4().hex[:8]}"
         now = self.clock.tick()
@@ -75,9 +77,39 @@ class StubHabitica:
             "date": f"{due_date_iso}T00:00:00.000Z" if due_date_iso else None,
             "checklist": list(checklist),
             "createdAt": now, "updatedAt": now,
+            "tags": [t for t in tags if t],
         }
         self._store[new_id] = raw
         return HabiticaTask.from_api(raw)
+
+    # Tag CRUD --------------------------------------------------------
+
+    def list_tags(self) -> list[dict[str, Any]]:
+        return list(self._tags.values())
+
+    def create_tag(self, name: str) -> dict[str, Any]:
+        new_id = f"tag-{uuid.uuid4().hex[:8]}"
+        obj = {"id": new_id, "name": name}
+        self._tags[new_id] = obj
+        return obj
+
+    def add_tag_to_task(self, task_id: str, tag_id: str) -> None:
+        raw = self._store.get(task_id)
+        if raw is None:
+            return
+        tags = raw.setdefault("tags", [])
+        if tag_id not in tags:
+            tags.append(tag_id)
+        raw["updatedAt"] = self.clock.tick()
+
+    def remove_tag_from_task(self, task_id: str, tag_id: str) -> None:
+        raw = self._store.get(task_id)
+        if raw is None:
+            return
+        tags = raw.get("tags", [])
+        if tag_id in tags:
+            tags.remove(tag_id)
+            raw["updatedAt"] = self.clock.tick()
 
     def update_todo(
         self, task_id: str, *, text: str | None = None, notes: str | None = None,

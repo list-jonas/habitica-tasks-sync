@@ -216,7 +216,7 @@ class GoogleTasksClient:
                 kwargs["updatedMin"] = updated_min
             resp = self._call(self._service.tasks().list(**kwargs))
             for item in resp.get("items", []) or []:
-                out.append(GoogleTask.from_api(item))
+                out.append(GoogleTask.from_api(item, tasklist_id=tasklist))
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
@@ -230,7 +230,7 @@ class GoogleTasksClient:
             if exc.resp.status == 404:
                 return None
             raise
-        return GoogleTask.from_api(data)
+        return GoogleTask.from_api(data, tasklist_id=tasklist)
 
     def insert_task(
         self,
@@ -252,7 +252,7 @@ class GoogleTasksClient:
         if completed:
             body["completed"] = _now_rfc3339()
         data = self._call(self._service.tasks().insert(tasklist=tasklist, body=body))
-        return GoogleTask.from_api(data)
+        return GoogleTask.from_api(data, tasklist_id=tasklist)
 
     def patch_task(
         self,
@@ -290,7 +290,7 @@ class GoogleTasksClient:
                 raise HttpError(_FakeResp(404), b"")
             return current
         data = self._call(self._service.tasks().patch(tasklist=tasklist, task=task_id, body=body))
-        return GoogleTask.from_api(data)
+        return GoogleTask.from_api(data, tasklist_id=tasklist)
 
     def delete_task(self, tasklist: str, task_id: str) -> bool:
         self._ensure_fresh()

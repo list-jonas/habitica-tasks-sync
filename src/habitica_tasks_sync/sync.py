@@ -5,9 +5,8 @@ Sync algorithm (per pair, per cycle):
 1. Fetch all Habitica todos (active + last 30 completed) — Habitica has no
    incremental endpoint, so a full pull is unavoidable.
 
-2. Fetch Google tasks since `last_google_sync - overlap` with
-   showDeleted/showHidden/showCompleted=true. Google supports a real
-   `updatedMin` cursor.
+2. Fetch Google tasks across every configured tasklist since
+   `last_google_sync - overlap` with showDeleted/showHidden/showCompleted=true.
 
 3. Detect deletions:
    - Habitica: any mapping whose habitica_id is no longer present in the
@@ -19,7 +18,9 @@ Sync algorithm (per pair, per cycle):
 
 4. For each surviving Habitica task with a mapping, compare its canonical
    content hash and updatedAt against the stored values to decide if a push
-   to Google is needed.
+   to Google is needed. If the Habitica task's tags now point at a
+   different configured list than the mapping records, migrate the task
+   to the new list (delete old, create new).
 
 5. For each surviving Google task with a mapping, compare similarly to
    decide if a push to Habitica is needed.
@@ -28,7 +29,13 @@ Sync algorithm (per pair, per cycle):
    `updatedAt` wins. The other side is overwritten.
 
 7. Unmapped tasks on either side become creations on the other side; the
-   resulting mapping is persisted.
+   resulting mapping is persisted. Routing is by tag:
+
+   - Habitica → Google: pick the configured tasklist whose tag matches
+     one of the task's tags; otherwise the default (first configured)
+     tasklist, with that list's tag added back to the Habitica task.
+   - Google → Habitica: read the source tasklist, look up its tag,
+     create the Habitica task with that tag attached.
 
 Tombstones prevent a deleted task on side A — still visible on side B
 because side B hasn't pulled yet — from being recreated on side A on the
@@ -39,11 +46,11 @@ from __future__ import annotations
 
 import itertools
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from .config import SyncPair
+from .config import SyncPair, TasklistConfig
 from .db import StateStore, TaskMapping
 from .google_tasks import GoogleTasksClient, overlap_window
 from .habitica import HabiticaClient, HabiticaError
@@ -66,16 +73,51 @@ class SyncStats:
     created_in_habitica: int = 0
     updated_in_habitica: int = 0
     deleted_in_habitica: int = 0
+    moved_in_google: int = 0
     conflicts_resolved: int = 0
     errors: int = 0
 
     def summary(self) -> str:
         return (
             f"[{self.pair}] "
-            f"google: +{self.created_in_google}/~{self.updated_in_google}/-{self.deleted_in_google} | "
+            f"google: +{self.created_in_google}/~{self.updated_in_google}"
+            f"/-{self.deleted_in_google}/>{self.moved_in_google} | "
             f"habitica: +{self.created_in_habitica}/~{self.updated_in_habitica}/-{self.deleted_in_habitica} | "
             f"conflicts: {self.conflicts_resolved} | errors: {self.errors}"
         )
+
+
+@dataclass(frozen=True)
+class TasklistRouting:
+    """Resolved tasklist + tag identifiers for one pair.
+
+    Computed once per `run_once()` so each downstream helper can answer
+    "which Google list does this Habitica task belong in?" / "which tag
+    represents this Google list?" in O(1) without extra API round trips.
+    """
+
+    tasklists: tuple[TasklistConfig, ...]
+    tasklist_ids: tuple[str, ...]
+    tag_id_by_name: dict[str, str]         # configured tag name → Habitica tag ID
+    tag_name_by_tasklist: dict[str, str]   # Google tasklist ID → tag name
+    tasklist_by_tag_id: dict[str, str]     # Habitica tag ID → Google tasklist ID
+
+    @property
+    def is_multi_list(self) -> bool:
+        return len(self.tasklists) > 1
+
+    @property
+    def default_tasklist_id(self) -> str:
+        return self.tasklist_ids[0]
+
+    def tag_id_for_tasklist(self, tasklist_id: str) -> str | None:
+        name = self.tag_name_by_tasklist.get(tasklist_id)
+        if not name:
+            return None
+        return self.tag_id_by_name.get(name)
+
+    def configured_tasklist(self, tasklist_id: str) -> bool:
+        return tasklist_id in self.tasklist_ids
 
 
 class SyncEngine:
@@ -95,30 +137,33 @@ class SyncEngine:
         self.store = store
         self.delete_propagation = delete_propagation
         self.tombstone_ttl_days = tombstone_ttl_days
-        self._tasklist_id: str | None = None
+        self._routing: TasklistRouting | None = None
 
     # --- public ---------------------------------------------------------
 
     def run_once(self) -> SyncStats:
         stats = SyncStats(pair=self.pair.name)
-        tasklist_id = self._resolve_tasklist()
-        log.info("[%s] sync start (tasklist=%s)", self.pair.name, tasklist_id)
+        routing = self._resolve_routing()
+        log.info(
+            "[%s] sync start (tasklists=%d, multi=%s)",
+            self.pair.name, len(routing.tasklist_ids), routing.is_multi_list,
+        )
 
         habitica_tasks = self._fetch_habitica()
-        # If the mapping table is empty (first sync, or DB lost) we need a
+        existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
+        # If we have no mappings at all (first sync, or DB lost) we need a
         # FULL Google fetch — otherwise the title-adoption pool only sees
         # tasks updated within the cursor window and will create
         # duplicates for older Google tasks.
-        existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
         force_full_google = not existing_mappings
-        google_tasks, new_cursor = self._fetch_google(tasklist_id, force_full=force_full_google)
+        google_tasks, new_cursor = self._fetch_google(routing, force_full=force_full_google)
 
         h_by_id = {t.id: t for t in habitica_tasks}
         g_by_id = {t.id: t for t in google_tasks}
 
         # 1) Propagate Habitica deletions → Google.
         if self.delete_propagation:
-            self._propagate_habitica_deletions(existing_mappings, h_by_id, tasklist_id, stats)
+            self._propagate_habitica_deletions(existing_mappings, h_by_id, routing, stats)
 
         # 2) Propagate Google deletions → Habitica.
         if self.delete_propagation:
@@ -127,29 +172,24 @@ class SyncEngine:
         # Refresh mappings after deletions.
         existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
 
-        # 3) Sync content changes for already-mapped tasks (handles conflicts).
+        # 3) Sync content changes for already-mapped tasks (handles conflicts and moves).
         self._sync_existing_mappings(
-            existing_mappings, h_by_id, g_by_id, tasklist_id, stats
+            existing_mappings, h_by_id, g_by_id, routing, stats
         )
 
-        # 4) Create missing counterparts in both directions. Pass the
-        # opposite-side index so unmapped tasks with matching titles can be
-        # adopted instead of duplicated (relevant on first sync).
+        # 4) Create missing counterparts in both directions.
+        existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
         self._create_missing_in_google(
-            h_by_id, existing_mappings, tasklist_id, stats, g_by_id=g_by_id,
+            h_by_id, existing_mappings, routing, stats, g_by_id=g_by_id,
         )
 
-        # Re-read mappings so the next direction sees what we just wrote.
         existing_mappings = {m.habitica_id: m for m in self.store.list_for_pair(self.pair.name)}
         self._create_missing_in_habitica(
-            g_by_id, existing_mappings, tasklist_id, stats, h_by_id=h_by_id,
+            g_by_id, existing_mappings, routing, stats, h_by_id=h_by_id,
         )
 
         self.store.set_last_google_sync(self.pair.name, new_cursor)
 
-        # Use the same RFC3339 format as `_now_iso()` so lexicographic
-        # comparison of timestamps in SQLite is correct (mixing `+00:00`
-        # and `.000Z` suffixes produces wrong-order results).
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=self.tombstone_ttl_days)
         ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -160,15 +200,55 @@ class SyncEngine:
         log.info(stats.summary())
         return stats
 
-    # --- fetch ----------------------------------------------------------
+    # --- routing --------------------------------------------------------
 
-    def _resolve_tasklist(self) -> str:
-        if self._tasklist_id is None:
-            self._tasklist_id = self.g.resolve_tasklist(
-                tasklist_id=self.pair.google.tasklist_id,
-                title=self.pair.google.tasklist_title,
-            )
-        return self._tasklist_id
+    def _resolve_routing(self) -> TasklistRouting:
+        if self._routing is not None:
+            return self._routing
+
+        configs = self.pair.google.tasklists
+        ids = tuple(
+            self.g.resolve_tasklist(tasklist_id=c.tasklist_id, title=c.tasklist_title)
+            for c in configs
+        )
+
+        tag_id_by_name: dict[str, str] = {}
+        tag_name_by_tasklist: dict[str, str] = {}
+        tasklist_by_tag_id: dict[str, str] = {}
+
+        configs_with_tag = [(c, tlid) for c, tlid in zip(configs, ids) if c.tag]
+        if configs_with_tag:
+            # Single tag list fetch covers all configured tags.
+            existing = {(t.get("name") or "").strip().casefold(): t for t in self.h.list_tags()}
+            for c, tlid in configs_with_tag:
+                tag_name = c.tag or ""
+                key = tag_name.strip().casefold()
+                tag_obj = existing.get(key)
+                if tag_obj is None:
+                    log.info("[%s] creating habitica tag %r for tasklist %s",
+                             self.pair.name, tag_name, c.display_name())
+                    tag_obj = self.h.create_tag(tag_name)
+                    if isinstance(tag_obj, dict) and tag_obj.get("name"):
+                        existing[(tag_obj["name"] or "").strip().casefold()] = tag_obj
+                tag_id = (tag_obj or {}).get("id")
+                if not tag_id:
+                    raise RuntimeError(
+                        f"could not resolve habitica tag {tag_name!r}: missing id in response"
+                    )
+                tag_id_by_name[tag_name] = tag_id
+                tag_name_by_tasklist[tlid] = tag_name
+                tasklist_by_tag_id[tag_id] = tlid
+
+        self._routing = TasklistRouting(
+            tasklists=configs,
+            tasklist_ids=ids,
+            tag_id_by_name=tag_id_by_name,
+            tag_name_by_tasklist=tag_name_by_tasklist,
+            tasklist_by_tag_id=tasklist_by_tag_id,
+        )
+        return self._routing
+
+    # --- fetch ----------------------------------------------------------
 
     def _fetch_habitica(self) -> list[HabiticaTask]:
         # Skip challenge/group tasks: they're owned by the challenge/group,
@@ -180,10 +260,8 @@ class SyncEngine:
             if t.type == "todo" and not t.is_managed_externally
         ]
 
-    def _fetch_google(self, tasklist_id: str, *, force_full: bool = False) -> tuple[list[GoogleTask], str]:
+    def _fetch_google(self, routing: TasklistRouting, *, force_full: bool = False) -> tuple[list[GoogleTask], str]:
         last = None if force_full else self.store.get_last_google_sync(self.pair.name)
-        # Always overlap the cursor by a few minutes to absorb clock skew between
-        # Google's servers and ours. Duplicates are deduped by ID downstream.
         cursor_iso: str | None = None
         if last:
             try:
@@ -193,15 +271,22 @@ class SyncEngine:
             cursor = (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
             cursor_iso = cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        tasks = self.g.list_tasks(
-            tasklist_id,
-            updated_min=cursor_iso,
-            show_completed=True,
-            show_deleted=True,
-            show_hidden=True,
-        )
+        all_tasks: list[GoogleTask] = []
+        for tlid in routing.tasklist_ids:
+            tasks = self.g.list_tasks(
+                tlid,
+                updated_min=cursor_iso,
+                show_completed=True,
+                show_deleted=True,
+                show_hidden=True,
+            )
+            # Make sure tasklist_id is set (defensive: client already does this).
+            for t in tasks:
+                if not t.tasklist_id:
+                    t.tasklist_id = tlid
+            all_tasks.extend(tasks)
         new_cursor = overlap_window(datetime.now(timezone.utc), minutes=0)
-        return tasks, new_cursor
+        return all_tasks, new_cursor
 
     # --- deletions ------------------------------------------------------
 
@@ -209,7 +294,7 @@ class SyncEngine:
         self,
         mappings: dict[str, TaskMapping],
         h_by_id: dict[str, HabiticaTask],
-        tasklist_id: str,
+        routing: TasklistRouting,
         stats: SyncStats,
     ) -> None:
         for habitica_id, mapping in list(mappings.items()):
@@ -225,14 +310,9 @@ class SyncEngine:
             if actual is not None and actual.type == "todo" and not actual.is_managed_externally:
                 h_by_id[habitica_id] = actual
                 continue
+            target_tasklist = mapping.google_tasklist or routing.default_tasklist_id
             try:
-                self.g.delete_task(mapping.google_tasklist or tasklist_id, mapping.google_id)
-                # Mapping removal + tombstones in one transaction so a
-                # crash here can't leave us with a deleted-on-Google task
-                # that gets recreated next cycle (no tombstone) or a
-                # stale mapping that re-attempts the delete forever. Both
-                # sides get tombstoned in case either system returns the
-                # task again (ID reuse, undelete, missed `deleted` flag).
+                self.g.delete_task(target_tasklist, mapping.google_id)
                 self.store.remove_mapping_with_tombstone(
                     self.pair.name,
                     habitica_id=habitica_id,
@@ -282,7 +362,7 @@ class SyncEngine:
         mappings: dict[str, TaskMapping],
         h_by_id: dict[str, HabiticaTask],
         g_by_id: dict[str, GoogleTask],
-        tasklist_id: str,
+        routing: TasklistRouting,
         stats: SyncStats,
     ) -> None:
         for habitica_id, mapping in mappings.items():
@@ -294,6 +374,23 @@ class SyncEngine:
             if g.deleted:
                 continue
 
+            # In multi-list mode, check whether the Habitica task's tags
+            # now point at a different configured list than the mapping
+            # records. If so, migrate before doing the regular sync.
+            if routing.is_multi_list:
+                intended = self._intended_tasklist_for_habitica(h, routing)
+                if intended is not None and intended != (mapping.google_tasklist or routing.default_tasklist_id):
+                    try:
+                        new_g = self._migrate_google_to_list(h, g, mapping, intended, stats)
+                        if new_g is not None:
+                            g = new_g
+                            mapping = self.store.get_by_habitica(self.pair.name, h.id) or mapping
+                    except Exception as exc:  # noqa: BLE001
+                        stats.errors += 1
+                        log.exception("[%s] failed to migrate task %s to %s: %s",
+                                      self.pair.name, h.id, intended, exc)
+                        continue
+
             h_can = h.to_canonical()
             g_can = g.to_canonical()
             h_changed = (h.updated_at != mapping.habitica_updated) or (h_can.content_hash() != mapping.habitica_hash)
@@ -302,11 +399,12 @@ class SyncEngine:
             if not h_changed and not g_changed:
                 continue
 
+            target_tasklist = mapping.google_tasklist or routing.default_tasklist_id
             try:
                 if h_changed and not g_changed:
-                    self._push_habitica_to_google(h, g, mapping, tasklist_id, stats)
+                    self._push_habitica_to_google(h, g, mapping, target_tasklist, stats)
                 elif g_changed and not h_changed:
-                    self._push_google_to_habitica(g, h, mapping, tasklist_id, stats)
+                    self._push_google_to_habitica(g, h, mapping, target_tasklist, routing, stats)
                 else:
                     # Both changed — last writer wins.
                     h_ts = _parse_iso(h.updated_at)
@@ -315,11 +413,11 @@ class SyncEngine:
                     if g_ts >= h_ts:
                         log.info("[%s] conflict on %s ↔ %s: google wins (%s vs %s)",
                                  self.pair.name, h.id, g.id, g.updated, h.updated_at)
-                        self._push_google_to_habitica(g, h, mapping, tasklist_id, stats)
+                        self._push_google_to_habitica(g, h, mapping, target_tasklist, routing, stats)
                     else:
                         log.info("[%s] conflict on %s ↔ %s: habitica wins (%s vs %s)",
                                  self.pair.name, h.id, g.id, h.updated_at, g.updated)
-                        self._push_habitica_to_google(h, g, mapping, tasklist_id, stats)
+                        self._push_habitica_to_google(h, g, mapping, target_tasklist, stats)
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
                 log.exception("[%s] failed to sync mapping %s ↔ %s: %s",
@@ -340,7 +438,7 @@ class SyncEngine:
             completed_arg = canonical.completed
 
         new_g = self.g.patch_task(
-            mapping.google_tasklist or tasklist_id,
+            tasklist_id,
             g.id,
             title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
             notes=notes,
@@ -349,9 +447,7 @@ class SyncEngine:
             completed=completed_arg,
         )
         stats.updated_in_google += 1
-        # `new_g` reflects what Google actually stored (date-only `due`,
-        # truncations, etc.) — hash from that, not from our send-side view.
-        self._record_mapping(h, new_g, mapping.google_tasklist or tasklist_id)
+        self._record_mapping(h, new_g, tasklist_id)
 
     def _push_google_to_habitica(
         self,
@@ -359,11 +455,11 @@ class SyncEngine:
         h: HabiticaTask,
         mapping: TaskMapping,
         tasklist_id: str,
+        routing: TasklistRouting,
         stats: SyncStats,
     ) -> None:
         canonical = g.to_canonical(checklist=h.to_canonical().checklist)
         notes = _strip_checklist_artifact(canonical.notes)
-        # Title/notes/due go through PUT; completion is its own endpoint.
         self.h.update_todo(
             h.id,
             text=canonical.title,
@@ -373,10 +469,56 @@ class SyncEngine:
         )
         if canonical.completed != h.completed:
             self.h.score_todo(h.id, complete=canonical.completed)
-        # Re-fetch to capture fresh updatedAt + computed completion timestamp.
+        # If the Habitica task is missing the tag for its source list, attach it.
+        if routing.is_multi_list:
+            self._ensure_habitica_has_tasklist_tag(h, tasklist_id, routing)
         refreshed = self.h.get_todo(h.id) or h
         stats.updated_in_habitica += 1
-        self._record_mapping(refreshed, g, mapping.google_tasklist or tasklist_id)
+        self._record_mapping(refreshed, g, tasklist_id)
+
+    # --- migrations -----------------------------------------------------
+
+    def _migrate_google_to_list(
+        self,
+        h: HabiticaTask,
+        g: GoogleTask,
+        mapping: TaskMapping,
+        new_tasklist_id: str,
+        stats: SyncStats,
+    ) -> GoogleTask | None:
+        """Move a Google task to a different list by recreating it.
+
+        Google Tasks has no cross-list move; the only safe path is
+        insert-into-new → update mapping → delete-old, in that order, so a
+        failure on the second step leaves the user with a duplicate (which
+        the user can resolve) rather than a missing task.
+        """
+
+        old_tasklist = mapping.google_tasklist or g.tasklist_id
+        if not old_tasklist:
+            return None
+        canonical = h.to_canonical()
+        new_g = self.g.insert_task(
+            new_tasklist_id,
+            title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
+            notes=_merge_notes_for_google(canonical),
+            due_date_iso=canonical.due_date,
+            completed=canonical.completed,
+        )
+        self._record_mapping(h, new_g, new_tasklist_id)
+        try:
+            self.g.delete_task(old_tasklist, g.id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] migrated %s ↔ %s to %s but failed to delete old task %s: %s",
+                        self.pair.name, h.id, new_g.id, new_tasklist_id, g.id, exc)
+        # Tombstone the OLD google id so the next cycle (still seeing it via
+        # cursor overlap or because the delete returned 404) doesn't try to
+        # recreate it on Habitica.
+        self.store.add_tombstone(self.pair.name, "google", g.id, _now_iso())
+        stats.moved_in_google += 1
+        log.info("[%s] moved google task: %s → %s for habitica %s (new id %s)",
+                 self.pair.name, old_tasklist, new_tasklist_id, h.id, new_g.id)
+        return new_g
 
     # --- creations ------------------------------------------------------
 
@@ -384,53 +526,57 @@ class SyncEngine:
         self,
         h_by_id: dict[str, HabiticaTask],
         mappings: dict[str, TaskMapping],
-        tasklist_id: str,
+        routing: TasklistRouting,
         stats: SyncStats,
         g_by_id: dict[str, GoogleTask] | None = None,
     ) -> None:
-        # Index unmapped, undeleted Google tasks by normalized title so we
-        # can adopt an existing match instead of creating a duplicate.
-        # Only used on first sync (or when an old mapping was lost) — once
-        # mapped, the ID handles linkage.
+        # Adoption pool: unmapped, undeleted Google tasks bucketed by their
+        # source tasklist so we can match within the same list only.
         mapped_google_ids = {m.google_id for m in mappings.values()}
-        adoption_pool: dict[str, GoogleTask] = {}
+        adoption_pool: dict[tuple[str, str], GoogleTask] = {}
         if g_by_id:
             for g in g_by_id.values():
                 if g.deleted or g.id in mapped_google_ids:
                     continue
-                key = _title_key(g.title)
-                # First seen wins (stable when iteration order is stable).
+                key = (g.tasklist_id or routing.default_tasklist_id, _title_key(g.title))
                 adoption_pool.setdefault(key, g)
 
         for h in h_by_id.values():
             if h.id in mappings:
                 continue
             if self.store.has_tombstone(self.pair.name, "habitica", h.id):
-                # We previously deleted this task on Habitica's side; do not
-                # recreate it on Google. The Habitica copy is a resurrection
-                # the user did manually — accept it but no longer treat it as
-                # a sync target until the user re-edits it.
                 continue
             try:
                 canonical = h.to_canonical()
-                key = _title_key(canonical.title)
-                adopted = adoption_pool.pop(key, None)
+                # Determine target list. In single-list mode this is always
+                # the only configured list. In multi-list mode we route by
+                # the task's tags, falling back to the default list (and
+                # tagging the Habitica task accordingly so future cycles
+                # are deterministic).
+                target_tasklist = self._intended_tasklist_for_habitica(h, routing) or routing.default_tasklist_id
+
+                adopted = adoption_pool.pop((target_tasklist, _title_key(canonical.title)), None)
                 if adopted is not None:
-                    log.info("[%s] adopted existing google task %s for habitica %s (title match %r)",
-                             self.pair.name, adopted.id, h.id, canonical.title)
-                    self._record_mapping(h, adopted, tasklist_id)
+                    log.info("[%s] adopted existing google task %s for habitica %s (title match %r, list=%s)",
+                             self.pair.name, adopted.id, h.id, canonical.title, target_tasklist)
+                    self._record_mapping(h, adopted, target_tasklist)
+                    if routing.is_multi_list:
+                        self._ensure_habitica_has_tasklist_tag(h, target_tasklist, routing)
                     continue
+
                 new_g = self.g.insert_task(
-                    tasklist_id,
+                    target_tasklist,
                     title=_truncate(canonical.title, GOOGLE_TITLE_MAX),
                     notes=_merge_notes_for_google(canonical),
                     due_date_iso=canonical.due_date,
                     completed=canonical.completed,
                 )
                 stats.created_in_google += 1
-                self._record_mapping(h, new_g, tasklist_id)
-                log.info("[%s] created google task %s for habitica %s",
-                         self.pair.name, new_g.id, h.id)
+                self._record_mapping(h, new_g, target_tasklist)
+                if routing.is_multi_list:
+                    self._ensure_habitica_has_tasklist_tag(h, target_tasklist, routing)
+                log.info("[%s] created google task %s for habitica %s (list=%s)",
+                         self.pair.name, new_g.id, h.id, target_tasklist)
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
                 log.exception("[%s] failed to create google task for habitica %s: %s",
@@ -440,20 +586,23 @@ class SyncEngine:
         self,
         g_by_id: dict[str, GoogleTask],
         mappings: dict[str, TaskMapping],
-        tasklist_id: str,
+        routing: TasklistRouting,
         stats: SyncStats,
         h_by_id: dict[str, HabiticaTask] | None = None,
     ) -> None:
         mapped_google_ids = {m.google_id for m in mappings.values()}
         mapped_habitica_ids = {m.habitica_id for m in mappings.values()}
 
-        adoption_pool: dict[str, HabiticaTask] = {}
+        # Adoption pool: unmapped Habitica tasks bucketed by the tasklist
+        # they "would" land in if we created them on Google now. The
+        # tag-derived bucket lets us pair like-with-like across sides.
+        adoption_pool: dict[tuple[str, str], HabiticaTask] = {}
         if h_by_id:
             for h in h_by_id.values():
                 if h.id in mapped_habitica_ids:
                     continue
-                key = _title_key(h.text)
-                adoption_pool.setdefault(key, h)
+                target = self._intended_tasklist_for_habitica(h, routing) or routing.default_tasklist_id
+                adoption_pool.setdefault((target, _title_key(h.text)), h)
 
         for g in g_by_id.values():
             if g.id in mapped_google_ids or g.deleted:
@@ -462,17 +611,29 @@ class SyncEngine:
                 continue
             try:
                 canonical = g.to_canonical()
-                key = _title_key(canonical.title)
-                adopted = adoption_pool.pop(key, None)
+                source_tasklist = g.tasklist_id or routing.default_tasklist_id
+                tag_id = routing.tag_id_for_tasklist(source_tasklist)
+                tag_name = routing.tag_name_by_tasklist.get(source_tasklist)
+
+                adopted = adoption_pool.pop((source_tasklist, _title_key(canonical.title)), None)
                 if adopted is not None:
-                    log.info("[%s] adopted existing habitica task %s for google %s (title match %r)",
-                             self.pair.name, adopted.id, g.id, canonical.title)
-                    self._record_mapping(adopted, g, g_tasklist=tasklist_id)
+                    log.info("[%s] adopted existing habitica task %s for google %s (title match %r, list=%s)",
+                             self.pair.name, adopted.id, g.id, canonical.title, source_tasklist)
+                    self._record_mapping(adopted, g, source_tasklist)
+                    if tag_id and tag_id not in adopted.tags:
+                        try:
+                            self.h.add_tag_to_task(adopted.id, tag_id)
+                            adopted.tags.append(tag_id)
+                        except HabiticaError as exc:
+                            log.warning("[%s] could not attach tag %r to habitica %s: %s",
+                                        self.pair.name, tag_name, adopted.id, exc)
                     continue
+
                 new_h = self.h.create_todo(
                     text=canonical.title,
                     notes=canonical.notes,
                     due_date_iso=canonical.due_date,
+                    tags=[tag_id] if tag_id else (),
                 )
                 if canonical.completed:
                     try:
@@ -482,22 +643,50 @@ class SyncEngine:
                         log.warning("[%s] could not score new habitica task complete: %s",
                                     self.pair.name, exc)
                 stats.created_in_habitica += 1
-                self._record_mapping(new_h, g, g_tasklist=tasklist_id)
-                log.info("[%s] created habitica task %s for google %s",
-                         self.pair.name, new_h.id, g.id)
+                self._record_mapping(new_h, g, source_tasklist)
+                log.info("[%s] created habitica task %s for google %s (list=%s, tag=%s)",
+                         self.pair.name, new_h.id, g.id, source_tasklist, tag_name)
             except Exception as exc:  # noqa: BLE001
                 stats.errors += 1
                 log.exception("[%s] failed to create habitica task for google %s: %s",
                               self.pair.name, g.id, exc)
 
+    # --- routing helpers -----------------------------------------------
+
+    def _intended_tasklist_for_habitica(
+        self, h: HabiticaTask, routing: TasklistRouting
+    ) -> str | None:
+        """Pick the configured tasklist a Habitica task should live in.
+
+        Returns the first match on the task's tag list (preserving the
+        order Habitica returned), or None if the task has no tag that
+        maps to a configured tasklist.
+        """
+
+        for tag_id in h.tags:
+            target = routing.tasklist_by_tag_id.get(tag_id)
+            if target is not None:
+                return target
+        return None
+
+    def _ensure_habitica_has_tasklist_tag(
+        self, h: HabiticaTask, tasklist_id: str, routing: TasklistRouting
+    ) -> None:
+        tag_id = routing.tag_id_for_tasklist(tasklist_id)
+        if not tag_id:
+            return
+        if tag_id in h.tags:
+            return
+        try:
+            self.h.add_tag_to_task(h.id, tag_id)
+            h.tags.append(tag_id)
+        except HabiticaError as exc:
+            log.warning("[%s] could not attach tasklist tag to habitica %s: %s",
+                        self.pair.name, h.id, exc)
+
     # --- mapping persistence -------------------------------------------
 
     def _record_mapping(self, h: HabiticaTask, g: GoogleTask, g_tasklist: str) -> None:
-        # Hash each side from its own observed state. The two hashes can
-        # legitimately differ (e.g. Habitica's checklist gets flattened
-        # into Google's notes) — what matters is that each side's hash
-        # matches what's actually stored on that side, so we can detect
-        # subsequent edits without false positives every cycle.
         self.store.upsert_mapping(
             TaskMapping(
                 pair_name=self.pair.name,
@@ -601,4 +790,4 @@ def _strip_checklist_artifact(notes: str) -> str:
 
 
 # Re-export for tests / external introspection.
-__all__ = ["SyncEngine", "SyncStats"]
+__all__ = ["SyncEngine", "SyncStats", "TasklistRouting"]
